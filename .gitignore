@@ -1,0 +1,21 @@
+# Build artifacts
+/target
+/dist
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+
+# Local environment / secrets
+.env
+
+# Misc
+*.orig
+*.pdb

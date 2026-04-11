@@ -1,0 +1,24 @@
+# Cross-compilation linkers used by `scripts/build-all.sh`.
+#
+# These are required so `cargo build --target <triple>` produces a working
+# binary without extra command-line flags. Toolchain installation is the
+# operator's responsibility — the build script checks for missing linkers
+# and prints a clear error rather than silently producing a broken binary.
+
+[target.aarch64-unknown-linux-gnu]
+# Provided by the `aarch64-linux-gnu-gcc` package on Arch / CachyOS,
+# `gcc-aarch64-linux-gnu` on Debian / Ubuntu, and `gcc-aarch64-linux-gnu`
+# on Fedora / RHEL.
+linker = "aarch64-linux-gnu-gcc"
+
+# x86_64-unknown-linux-gnu builds natively on Linux without any linker
+# override. macOS users cross-compiling to Linux need to install
+# `x86_64-linux-gnu-gcc` (e.g. via `brew install x86_64-linux-gnu-gcc`)
+# and uncomment the block below.
+#
+# [target.x86_64-unknown-linux-gnu]
+# linker = "x86_64-linux-gnu-gcc"
+
+# Apple targets are built with the native macOS toolchain when run on a
+# Mac. Cross-compiling to macOS from Linux requires osxcross and is out
+# of scope for this config.
