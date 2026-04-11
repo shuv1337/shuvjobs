@@ -8,9 +8,15 @@ anacron, and launchd.
 
 <!-- Replace these placeholders with real screenshots before publishing. -->
 
+### Main View
+
 ![sta main view](docs/screenshots/main.png)
 
+### Detail Pane
+
 ![sta detail pane](docs/screenshots/detail.png)
+
+### Filter Mode
 
 ![sta filter mode](docs/screenshots/filter.png)
 
