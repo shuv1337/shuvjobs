@@ -56,7 +56,6 @@ pub fn run(opts: RunOptions) -> Result<()> {
     result
 }
 
-
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Mode {
     #[default]
@@ -134,10 +133,7 @@ impl App {
         let Some(kind) = self.available_sources.get(self.filter_cursor).copied() else {
             return;
         };
-        let allowed = self
-            .filter
-            .allowed_sources
-            .get_or_insert_with(HashSet::new);
+        let allowed = self.filter.allowed_sources.get_or_insert_with(HashSet::new);
         if allowed.contains(&kind) {
             allowed.remove(&kind);
         } else {
@@ -453,9 +449,7 @@ fn draw_body(
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(area);
         draw_table(frame, chunks[0], visible, table_state, now);
-        let selected = table_state
-            .selected()
-            .and_then(|i| visible.get(i));
+        let selected = table_state.selected().and_then(|i| visible.get(i));
         draw_detail(frame, chunks[1], selected, now);
     } else {
         draw_table(frame, area, visible, table_state, now);
@@ -530,14 +524,8 @@ fn format_detail(t: &ScheduledTask, now: DateTime<Utc>) -> Vec<Line<'static>> {
         kv("Source", format_source(t.source)),
         kv("Command", &t.command),
         kv("Schedule", &format_schedule(&t.schedule)),
-        kv(
-            "Last run",
-            &format_dt_with_relative(t.last_run, now),
-        ),
-        kv(
-            "Next run",
-            &format_dt_with_relative(t.next_run, now),
-        ),
+        kv("Last run", &format_dt_with_relative(t.last_run, now)),
+        kv("Next run", &format_dt_with_relative(t.next_run, now)),
         kv("Status", &format_status_long(t.last_status.as_ref())),
     ];
     if let Some(d) = t.last_duration {
@@ -647,12 +635,14 @@ fn draw_footer(
         narrow
     };
 
-    let pad = width
-        .saturating_sub(left.chars().count() + right.chars().count());
+    let pad = width.saturating_sub(left.chars().count() + right.chars().count());
     let line = Line::from(vec![
         Span::styled(left, Style::default().add_modifier(Modifier::DIM)),
         Span::raw(" ".repeat(pad)),
-        Span::styled(right.to_string(), Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(
+            right.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }

@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use sta_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
 
 #[derive(Debug, Default)]
@@ -24,6 +24,15 @@ impl CronAdapter {
     /// `/etc/crontab` and `/etc/cron.d/*` (column layout includes user).
     /// Per-user crontabs from `crontab -l` omit the user column.
     pub fn parse_crontab(contents: &str, origin: &str, has_user_field: bool) -> Vec<ScheduledTask> {
+        Self::parse_crontab_at(contents, origin, has_user_field, Local::now())
+    }
+
+    pub fn parse_crontab_at<Tz: TimeZone>(
+        contents: &str,
+        origin: &str,
+        has_user_field: bool,
+        now: DateTime<Tz>,
+    ) -> Vec<ScheduledTask> {
         let mut out = Vec::new();
         for (idx, raw) in contents.lines().enumerate() {
             let line = raw.trim();
@@ -49,7 +58,7 @@ impl CronAdapter {
             }
 
             let schedule = ScheduleType::Cron(schedule_expr);
-            let next_run = compute_next_run(&schedule, Utc::now());
+            let next_run = compute_next_run(&schedule, now.clone());
             out.push(ScheduledTask {
                 id: format!("{origin}:{}", idx + 1),
                 name: command_basename(&command),
@@ -67,8 +76,17 @@ impl CronAdapter {
 
     /// `period` is one of `hourly`/`daily`/`weekly`/`monthly`.
     pub fn parse_run_parts(period: &str, scripts: &[&str], dir: &str) -> Vec<ScheduledTask> {
+        Self::parse_run_parts_at(period, scripts, dir, Local::now())
+    }
+
+    pub fn parse_run_parts_at<Tz: TimeZone>(
+        period: &str,
+        scripts: &[&str],
+        dir: &str,
+        now: DateTime<Tz>,
+    ) -> Vec<ScheduledTask> {
         let schedule = ScheduleType::Calendar(format!("@{period}"));
-        let next_run = compute_next_run(&schedule, Utc::now());
+        let next_run = compute_next_run(&schedule, now);
         scripts
             .iter()
             .map(|script| ScheduledTask {
@@ -125,12 +143,10 @@ impl TaskSource for CronAdapter {
         let crontab_bin_present = which("crontab").is_some();
 
         let any_run_parts = run_parts_dirs.iter().any(|(_, p)| Path::new(p).exists());
-        if !etc_crontab.exists()
-            && !cron_d.exists()
-            && !any_run_parts
-            && !crontab_bin_present
-        {
-            return Err(Error::Unavailable("no cron files or `crontab` binary".into()));
+        if !etc_crontab.exists() && !cron_d.exists() && !any_run_parts && !crontab_bin_present {
+            return Err(Error::Unavailable(
+                "no cron files or `crontab` binary".into(),
+            ));
         }
 
         let mut tasks = Vec::new();
@@ -208,13 +224,26 @@ fn is_env_assignment(line: &str) -> bool {
 
 /// `@reboot`, `@hourly`, ... lines.
 fn parse_shortcut_line(line: &str, has_user_field: bool) -> Option<(String, String)> {
-    let mut iter = line.splitn(if has_user_field { 3 } else { 2 }, char::is_whitespace);
-    let shortcut = iter.next()?.to_string();
-    if has_user_field {
-        let _user = iter.next()?;
+    let shortcut = line.split_whitespace().next()?.to_string();
+    let fields_before_command = if has_user_field { 2 } else { 1 };
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    for _ in 0..fields_before_command {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
     }
-    let rest = iter.next()?.trim().to_string();
-    Some((shortcut, rest))
+    let command = line[i..].trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some((shortcut, command.to_string()))
 }
 
 fn parse_five_field_line(line: &str, has_user_field: bool) -> Option<(String, String)> {
@@ -300,9 +329,9 @@ fn which(bin: &str) -> Option<PathBuf> {
 /// Next run after `now` for cron and `@hourly`/`@daily`/etc aliases.
 /// Returns `None` for `@reboot`, non-cron schedules, and unparseable
 /// expressions (better to show the row with no next-run than drop it).
-pub fn compute_next_run(
+pub fn compute_next_run<Tz: TimeZone>(
     schedule: &ScheduleType,
-    now: DateTime<Utc>,
+    now: DateTime<Tz>,
 ) -> Option<DateTime<Utc>> {
     let expr = match schedule {
         ScheduleType::Cron(s) => s.as_str(),
@@ -315,7 +344,9 @@ pub fn compute_next_run(
         return None;
     }
     let cron = croner::Cron::new(expr).parse().ok()?;
-    cron.find_next_occurrence(&now, false).ok()
+    cron.find_next_occurrence(&now, false)
+        .ok()
+        .map(|next| next.with_timezone(&Utc))
 }
 
 #[cfg(test)]
@@ -352,6 +383,18 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
         assert!(matches!(reboot.schedule, ScheduleType::Cron(ref s) if s == "@reboot"));
         assert_eq!(reboot.command, "/usr/local/bin/warmup-cache");
         assert_eq!(reboot.name, "warmup-cache");
+    }
+
+    #[test]
+    fn parses_aligned_shortcut_without_leaking_user_into_command() {
+        let tasks = CronAdapter::parse_crontab(
+            "@daily   root   /usr/local/bin/backup --full\n",
+            "/etc/crontab",
+            true,
+        );
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].name, "backup");
+        assert_eq!(tasks[0].command, "/usr/local/bin/backup --full");
     }
 
     const CRON_D_ENTRY: &str = "\
@@ -441,6 +484,26 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/false
     }
 
     #[test]
+    fn compute_next_run_uses_the_supplied_local_timezone() {
+        let timezone = chrono::FixedOffset::east_opt(3 * 60 * 60).unwrap();
+        let now = timezone.with_ymd_and_hms(2026, 4, 14, 1, 30, 0).unwrap();
+        let next = compute_next_run(&ScheduleType::Cron("0 2 * * *".into()), now).unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 4, 13, 23, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_crontab_uses_the_supplied_local_timezone() {
+        let timezone = chrono::FixedOffset::west_opt(7 * 60 * 60).unwrap();
+        let now = timezone.with_ymd_and_hms(2026, 4, 14, 1, 30, 0).unwrap();
+        let tasks =
+            CronAdapter::parse_crontab_at("0 2 * * * root /bin/true\n", "/etc/crontab", true, now);
+        assert_eq!(
+            tasks[0].next_run,
+            Some(Utc.with_ymd_and_hms(2026, 4, 14, 9, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
     fn compute_next_run_every_five_minutes_is_within_five_minutes() {
         let now = Utc::now();
         let next = compute_next_run(&ScheduleType::Cron("*/5 * * * *".into()), now).unwrap();
@@ -488,7 +551,6 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/false
         assert!(delta > chrono::Duration::zero());
         assert!(delta <= chrono::Duration::minutes(60));
     }
-
 
     #[test]
     fn parse_crontab_populates_next_run_for_valid_expression() {

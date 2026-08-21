@@ -8,9 +8,9 @@
 use std::time::Duration;
 
 use plist::Value;
-use sta_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
 #[cfg(target_os = "macos")]
 use sta_core::TaskStatus;
+use sta_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
 
 #[derive(Debug, Default)]
 pub struct LaunchdAdapter;
@@ -56,7 +56,10 @@ impl LaunchdAdapter {
             Value::Dictionary(d) => d,
             _ => return Ok(None),
         };
-        let Some(label) = dict.get("Label").and_then(|v| v.as_string()).map(str::to_string)
+        let Some(label) = dict
+            .get("Label")
+            .and_then(|v| v.as_string())
+            .map(str::to_string)
         else {
             return Ok(None);
         };
@@ -74,7 +77,10 @@ impl LaunchdAdapter {
                 .to_string(),
         };
 
-        let schedule = if let Some(secs) = dict.get("StartInterval").and_then(|v| v.as_unsigned_integer()) {
+        let schedule = if let Some(secs) = dict
+            .get("StartInterval")
+            .and_then(|v| v.as_unsigned_integer())
+        {
             ScheduleType::Interval(Duration::from_secs(secs))
         } else if let Some(cal) = dict.get("StartCalendarInterval") {
             ScheduleType::Calendar(format_calendar_interval(cal))
@@ -165,10 +171,7 @@ impl TaskSource for LaunchdAdapter {
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            eprintln!(
-                                "warning: failed to parse {}: {e}",
-                                path.display()
-                            );
+                            eprintln!("warning: failed to parse {}: {e}", path.display());
                         }
                     }
                 }

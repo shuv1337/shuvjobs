@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
-use sta_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind, TaskStatus};
+use sta_core::{
+    Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind, TaskStatus,
+};
 
 #[derive(Debug, Default)]
 pub struct SystemdAdapter;
@@ -151,10 +153,8 @@ impl TaskSource for SystemdAdapter {
 
         for task in &mut tasks {
             // Enrich with timer-side schedule + last result.
-            if let Some(text) = run_show(
-                &task.id,
-                &["TimersCalendar", "TimersMonotonic", "Result"],
-            ) {
+            if let Some(text) = run_show(&task.id, &["TimersCalendar", "TimersMonotonic", "Result"])
+            {
                 let timer = Self::parse_show_timer(&text);
                 if let Some(expr) = timer.on_calendar {
                     task.schedule = ScheduleType::Calendar(expr);
@@ -379,7 +379,8 @@ mod tests {
         assert!(matches!(err, Error::Parse { .. }));
     }
 
-    const SHOW_TIMER_SUCCESS: &str = "TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Sat 2026-04-11 17:04:57 +03 }\n\
+    const SHOW_TIMER_SUCCESS: &str =
+        "TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Sat 2026-04-11 17:04:57 +03 }\n\
                                        LastTriggerUSec=Mon 2026-04-06 21:19:54 +03\n\
                                        Result=success\n";
 
@@ -391,7 +392,8 @@ mod tests {
         assert_eq!(parsed.result.as_deref(), Some("success"));
     }
 
-    const SHOW_TIMER_FAILED: &str = "TimersCalendar={ OnCalendar=daily ; next_elapse=Sat 2026-04-11 00:00:00 +03 }\n\
+    const SHOW_TIMER_FAILED: &str =
+        "TimersCalendar={ OnCalendar=daily ; next_elapse=Sat 2026-04-11 00:00:00 +03 }\n\
                                       Result=failed\n";
 
     #[test]
@@ -427,8 +429,14 @@ mod tests {
 
     #[test]
     fn parse_systemd_duration_handles_common_forms() {
-        assert_eq!(parse_systemd_duration("15min"), Some(Duration::from_secs(900)));
-        assert_eq!(parse_systemd_duration("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(
+            parse_systemd_duration("15min"),
+            Some(Duration::from_secs(900))
+        );
+        assert_eq!(
+            parse_systemd_duration("1h"),
+            Some(Duration::from_secs(3600))
+        );
         assert_eq!(parse_systemd_duration("30s"), Some(Duration::from_secs(30)));
         assert_eq!(
             parse_systemd_duration("1h30min"),

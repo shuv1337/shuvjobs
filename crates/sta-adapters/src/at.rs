@@ -5,7 +5,7 @@
 
 use std::process::Command;
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use sta_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
 
 #[derive(Debug, Default)]
@@ -19,13 +19,20 @@ impl AtAdapter {
     /// Parse `atq` output. Rows look like `12<TAB>Thu Apr 14 14:00:00 2026 a alice`.
     /// The returned tasks have empty `command` — fill in via [`AtAdapter::parse_at_c`].
     pub fn parse_atq(atq_output: &str) -> Vec<ScheduledTask> {
+        Self::parse_atq_in_timezone(atq_output, &Local)
+    }
+
+    pub fn parse_atq_in_timezone<Tz: TimeZone>(
+        atq_output: &str,
+        timezone: &Tz,
+    ) -> Vec<ScheduledTask> {
         let mut tasks = Vec::new();
         for line in atq_output.lines() {
             let line = line.trim_end();
             if line.is_empty() {
                 continue;
             }
-            let Some(parsed) = parse_atq_line(line) else {
+            let Some(parsed) = parse_atq_line_in_timezone(line, timezone) else {
                 eprintln!("warning: skipping unparseable atq line: {line}");
                 continue;
             };
@@ -130,7 +137,7 @@ struct AtqRow {
     scheduled: DateTime<Utc>,
 }
 
-fn parse_atq_line(line: &str) -> Option<AtqRow> {
+fn parse_atq_line_in_timezone<Tz: TimeZone>(line: &str, timezone: &Tz) -> Option<AtqRow> {
     // Format is `<id>\t<date> <queue> <user>`. The date is exactly five
     // tokens (`Thu Apr 14 14:00:00 2026`), so we just take the first
     // five whitespace tokens after the id.
@@ -142,9 +149,10 @@ fn parse_atq_line(line: &str) -> Option<AtqRow> {
     }
     let date_str = date_tokens.join(" ");
     let naive = NaiveDateTime::parse_from_str(&date_str, "%a %b %d %H:%M:%S %Y").ok()?;
-    // atq reports local time; we coerce to UTC since the TUI shows
-    // relative deltas where a tz offset is invisible anyway.
-    let scheduled = Utc.from_utc_datetime(&naive);
+    let scheduled = timezone
+        .from_local_datetime(&naive)
+        .earliest()?
+        .with_timezone(&Utc);
     Some(AtqRow { id, scheduled })
 }
 
@@ -164,6 +172,17 @@ mod tests {
         assert!(matches!(t.schedule, ScheduleType::OneShot(_)));
         assert!(t.next_run.is_some());
         assert!(t.command.is_empty(), "command is filled in by parse_at_c");
+    }
+
+    #[test]
+    fn parses_atq_timestamp_in_the_supplied_local_timezone() {
+        let timezone = chrono::FixedOffset::east_opt(3 * 60 * 60).unwrap();
+        let tasks =
+            AtAdapter::parse_atq_in_timezone("12\tTue Apr 14 14:00:00 2026 a alice", &timezone);
+        assert_eq!(
+            tasks[0].next_run,
+            Some(Utc.with_ymd_and_hms(2026, 4, 14, 11, 0, 0).unwrap())
+        );
     }
 
     #[test]

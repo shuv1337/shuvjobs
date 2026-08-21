@@ -71,7 +71,11 @@ impl Filter {
 }
 
 pub fn apply(tasks: &[ScheduledTask], filter: &Filter, sort: SortMode) -> Vec<ScheduledTask> {
-    let mut out: Vec<ScheduledTask> = tasks.iter().filter(|t| filter.matches(t)).cloned().collect();
+    let mut out: Vec<ScheduledTask> = tasks
+        .iter()
+        .filter(|t| filter.matches(t))
+        .cloned()
+        .collect();
     sort_in_place(&mut out, sort);
     out
 }
@@ -92,7 +96,7 @@ pub fn sort_in_place(tasks: &mut [ScheduledTask], mode: SortMode) {
             tasks.sort_by(|a, b| option_dt_desc(a.last_run, b.last_run));
         }
         SortMode::Name => {
-            tasks.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            tasks.sort_by_key(|task| task.name.to_lowercase());
         }
         SortMode::Status => {
             tasks.sort_by(|a, b| {
@@ -192,10 +196,9 @@ mod tests {
         };
         let out = apply(&tasks, &f, SortMode::Default);
         assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|t| matches!(
-            t.source,
-            TaskSourceKind::Systemd | TaskSourceKind::Cron
-        )));
+        assert!(out
+            .iter()
+            .all(|t| matches!(t.source, TaskSourceKind::Systemd | TaskSourceKind::Cron)));
     }
 
     #[test]
