@@ -28,10 +28,27 @@ fixes for scheduler parsing, timezone handling, and remote SSH failures. The
 first ShuvJobs version is `0.2.0`, avoiding collision with the inherited
 upstream `v0.1.2` tag. The minimum Rust version is 1.88, and the initial fork
 also updates terminal and plist dependencies to versions without known RustSec
-vulnerabilities. The
-product direction is full create, read, update, and delete management across
-cron, systemd timers, `at`, anacron, and launchd; the current baseline remains
-read-only until those management capabilities are implemented and documented.
+vulnerabilities. The product direction — full create, read, update, and delete management across
+cron, systemd timers, `at`, anacron, and launchd — is implemented: `add`,
+`edit`, `rm`, `enable`, and `disable` work from the CLI and the TUI, locally
+and over SSH, with `--dry-run` plans, opt-in `sudo -n` escalation through
+`--sudo`, and backups written on the operator's machine.
+
+Management introduces three ShuvJobs conventions that have no upstream
+equivalent:
+
+- `# managed by shuvjobs` heads every cron and systemd file ShuvJobs creates,
+  and a `ShuvjobsManaged` key marks every launchd plist it creates. ShuvJobs
+  rewrites or deletes only files carrying the marker; anything else is
+  preserved, or refused with an `unsupported` error.
+- `#shuvjobs-disabled# ` prefixes a disabled cron or anacron line. ShuvJobs
+  still parses such a line and reports it as a job with `enabled: false`;
+  every other scheduler sees an ordinary comment.
+- Managed directories are fixed: `~/.config/systemd/user` and
+  `/etc/systemd/system` for timers, `/etc/cron.d` for system cron,
+  `/etc/anacrontab` for anacron, and `~/Library/LaunchAgents` and
+  `/Library/LaunchDaemons` for launchd. Writes outside them — vendor units,
+  run-parts scripts, `/System` plists — are refused rather than attempted.
 
 ## Upstream Policy
 

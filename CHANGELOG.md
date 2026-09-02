@@ -65,3 +65,37 @@
   unit file that the timer listing did not name is reported with its
   schedule, command, location, and enablement. Template units (`foo@.timer`)
   are skipped.
+- Manage jobs, not just read them: `add`, `edit`, `rm`, `enable`, and
+  `disable` subcommands alongside the explicit `list` and `show`, for cron,
+  systemd timers, `at`, anacron, and launchd. Ids are the ones `list` prints;
+  `--source` disambiguates an id two schedulers both claim.
+- Add `--dry-run` (render a unified diff per file plus the exact commands and
+  exit without writing), `-y`/`--yes` (skip the `rm` confirmation; a
+  non-terminal stdin without it is refused rather than treated as yes), and
+  `--sudo` (wrap privileged steps in `sudo -n --`). Without `--sudo`,
+  operations needing root fail before writing anything and name the flag.
+- Define exit codes for scripting: 0 ok, 1 runtime/not-found/ambiguous/
+  aborted, 2 usage or validation, 3 needs root, 4 conflict, 5 unsupported.
+  `--json` mutations report `{ok, op, source, id, host, dry_run, files,
+  commands, notes}`, or `{ok: false, error: {kind, message}}`.
+- Back up every file a mutation overwrites or removes to
+  `$XDG_STATE_HOME/shuvjobs/backups/<host>/<flattened-path>.<timestamp>` on
+  the machine running shuvjobs, never next to the target, before the first
+  write; the path is reported even when the apply fails.
+- Per-scheduler management: cron writes the invoking user's crontab or
+  `/etc/cron.d/<name>`; systemd writes a `.timer`/`.service` pair under
+  `~/.config/systemd/user` or `/etc/systemd/system` and reloads and enables
+  them; `at` queues and requeues jobs (edit recreates, never losing the job);
+  anacron edits `/etc/anacrontab`; launchd writes LaunchAgents/LaunchDaemons
+  plists and bootstraps them. Files shuvjobs created carry
+  `# managed by shuvjobs` (or a `ShuvjobsManaged` plist key) and only those
+  are rewritten; disabling a cron or anacron job prefixes its line with
+  `#shuvjobs-disabled# `. Vendor systemd units, `/System` plists, and
+  run-parts scripts are refused with an `unsupported` error.
+- Manage over SSH: every subcommand works against `--host`, with reads and
+  writes sharing one multiplex master.
+- Add TUI editing: `a` add, `e` edit, `d` delete, `t` toggle enabled. A form
+  popup (Tab/Shift-Tab between fields, ◂ ▸ to change pickers, Enter to plan,
+  Esc to cancel) leads to a scrollable confirmation popup showing the plan
+  (`y` apply, `n` cancel). `q` no longer quits from inside a popup, and under
+  `--dry-run` applying reports `dry run: not applied`.
