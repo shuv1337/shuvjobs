@@ -33,7 +33,7 @@ use shuvjobs_core::host::shell::{
     shell_quote, shell_safe_filename, shell_safe_username, write_file_script, ABSENT_EXIT,
 };
 use shuvjobs_core::host::{
-    privileged_command, CmdOutput, Host, HostOs, Privilege, PrivilegePolicy,
+    privileged_command, run_operation, CmdOutput, Host, HostOs, Privilege, PrivilegePolicy,
 };
 use shuvjobs_core::{Error as CoreError, Result as CoreResult, ScheduledTask, TaskStatus};
 
@@ -342,7 +342,7 @@ impl FileOp {
             Self::Remove => "remove",
             Self::Exists => "check",
             Self::ListDir => "list",
-            Self::MkdirAll => "mkdir",
+            Self::MkdirAll => "create directory",
         };
         format!("{verb} {path}")
     }
@@ -480,7 +480,7 @@ impl Host for RemoteCollector {
     }
 
     fn run(&self, cmd: &str, stdin: Option<&[u8]>, privilege: Privilege) -> CoreResult<CmdOutput> {
-        let rendered = remote_command(cmd, privilege, self.policy(), cmd)?;
+        let rendered = remote_command(cmd, privilege, self.policy(), &run_operation(cmd))?;
         self.run_raw(&rendered, stdin).map_err(host_error)
     }
 
@@ -1370,6 +1370,71 @@ mod tests {
             CoreError::NeedsRoot { operation } => assert_eq!(operation, "write /etc/cron.d/x"),
             other => panic!("expected NeedsRoot, got {other:?}"),
         }
+    }
+
+    /// A refusal has to say what we were doing, not recite the pinned
+    /// shell script that would have done it.
+    #[test]
+    fn file_op_refusals_are_described_in_plain_words() {
+        for (op, path, want) in [
+            (
+                FileOp::Read,
+                "/etc/systemd/system/x.timer",
+                "read /etc/systemd/system/x.timer",
+            ),
+            (
+                FileOp::Write { mode: 0o644 },
+                "/etc/cron.d/x",
+                "write /etc/cron.d/x",
+            ),
+            (FileOp::Remove, "/etc/cron.d/x", "remove /etc/cron.d/x"),
+            (FileOp::Exists, "/etc/cron.d/x", "check /etc/cron.d/x"),
+            (FileOp::ListDir, "/etc/cron.d", "list /etc/cron.d"),
+            (
+                FileOp::MkdirAll,
+                "/etc/systemd/system",
+                "create directory /etc/systemd/system",
+            ),
+        ] {
+            let err = file_op_command(op, path, Privilege::Root, policy(false, false))
+                .expect_err("must refuse");
+            match err {
+                CoreError::NeedsRoot { operation } => assert_eq!(operation, want),
+                other => panic!("expected NeedsRoot for {want}, got {other:?}"),
+            }
+        }
+    }
+
+    /// `Host::run` describes itself by the command it would have run, in
+    /// short form and without the sudo wrapper. Rendering is pinned here
+    /// rather than through the collector so no SSH round-trip is needed.
+    #[test]
+    fn run_refusal_names_the_command_in_short_form() {
+        let cmd = "systemctl enable --now 'x.timer'";
+        let err = remote_command(
+            cmd,
+            Privilege::Root,
+            policy(false, false),
+            &run_operation(cmd),
+        )
+        .expect_err("must refuse");
+        match err {
+            CoreError::NeedsRoot { operation } => {
+                assert_eq!(operation, "run systemctl enable --now 'x.timer'");
+            }
+            other => panic!("expected NeedsRoot, got {other:?}"),
+        }
+        // With sudo the same call goes through, wrapped.
+        assert_eq!(
+            remote_command(
+                cmd,
+                Privilege::Root,
+                policy(false, true),
+                &run_operation(cmd)
+            )
+            .unwrap(),
+            "sudo -n -- systemctl enable --now 'x.timer'"
+        );
     }
 
     #[test]

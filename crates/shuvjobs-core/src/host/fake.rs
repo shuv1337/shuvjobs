@@ -12,7 +12,9 @@ use std::sync::Mutex;
 
 use chrono::FixedOffset;
 
-use super::{privileged_command, CmdOutput, Host, HostOs, Privilege, PrivilegePolicy};
+use super::{
+    privileged_command, run_operation, CmdOutput, Host, HostOs, Privilege, PrivilegePolicy,
+};
 use crate::{Error, Result};
 
 fn output(code: i32, stdout: &str, stderr: &str) -> CmdOutput {
@@ -203,7 +205,7 @@ impl Host for FakeHost {
     fn run(&self, cmd: &str, stdin: Option<&[u8]>, privilege: Privilege) -> Result<CmdOutput> {
         // Consulted for its refusal only: what we record is the plain
         // command, not the sudo-wrapped rendering.
-        privileged_command(cmd, privilege, self.policy, cmd)?;
+        privileged_command(cmd, privilege, self.policy, &run_operation(cmd))?;
         let nth = {
             let mut state = self.lock();
             state.calls.push(Call {
@@ -274,7 +276,7 @@ impl Host for FakeHost {
     fn create_dir_all(&self, path: &str, privilege: Privilege) -> Result<()> {
         // Directories are implied by the paths of the files in the map,
         // so there is nothing to create — only the privilege to check.
-        self.guard(path, privilege, &format!("mkdir {path}"))
+        self.guard(path, privilege, &format!("create directory {path}"))
     }
 }
 

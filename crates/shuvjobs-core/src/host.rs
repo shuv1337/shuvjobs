@@ -182,6 +182,27 @@ pub fn privileged_command<'a>(
     }
 }
 
+/// Longest command text kept in a [`run_operation`] description. Long
+/// enough to name the program and its arguments, short enough that a
+/// heredoc-sized script does not become the error message.
+const RUN_OPERATION_LIMIT: usize = 60;
+
+/// The plain-words description of running `cmd`, for the operator-facing
+/// half of [`Error::NeedsRoot`]. The shell script a host would actually
+/// send is not an answer to "what were you trying to do", so it is
+/// summarized: `run systemctl enable --now 'x.timer'`.
+pub fn run_operation(cmd: &str) -> String {
+    let cmd = cmd.trim();
+    let mut out = String::from("run ");
+    if cmd.chars().count() <= RUN_OPERATION_LIMIT {
+        out.push_str(cmd);
+    } else {
+        out.extend(cmd.chars().take(RUN_OPERATION_LIMIT));
+        out.push_str("...");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +251,22 @@ mod tests {
             Error::NeedsRoot { operation } => assert_eq!(operation, "write /etc/cron.d/x"),
             other => panic!("expected NeedsRoot, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_operation_names_the_command_in_plain_words() {
+        assert_eq!(
+            run_operation("systemctl enable --now 'x.timer'"),
+            "run systemctl enable --now 'x.timer'"
+        );
+        // Exactly at the limit: no ellipsis.
+        let sixty = "a".repeat(60);
+        assert_eq!(run_operation(&sixty), format!("run {sixty}"));
+        // Over it: truncated, and the reader can tell.
+        let long = "b".repeat(200);
+        let described = run_operation(&long);
+        assert_eq!(described, format!("run {}...", "b".repeat(60)));
+        assert!(described.len() < 70);
     }
 
     #[test]

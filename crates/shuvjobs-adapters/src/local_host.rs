@@ -19,7 +19,7 @@ use shuvjobs_core::host::shell::{
     exists_script, list_dir_script, mkdir_script, read_file_script, remove_file_script,
     write_file_script, ABSENT_EXIT,
 };
-use shuvjobs_core::host::{CmdOutput, Host, HostOs, Privilege, PrivilegePolicy};
+use shuvjobs_core::host::{run_operation, CmdOutput, Host, HostOs, Privilege, PrivilegePolicy};
 use shuvjobs_core::{Error, Result};
 
 use crate::process::{run_process, to_cmd_output};
@@ -61,9 +61,29 @@ impl LocalHost {
         privilege == Privilege::User || self.policy.is_root
     }
 
-    /// Run one of the pinned shell scripts as root.
-    fn script(&self, script: &str, stdin: Option<&[u8]>) -> Result<CmdOutput> {
-        self.run(script, stdin, Privilege::Root)
+    /// Run one of the pinned shell scripts as root. `operation` is the
+    /// plain-words description the operator sees if we have to refuse:
+    /// the script itself answers "how", never "what were you doing".
+    fn script(&self, script: &str, stdin: Option<&[u8]>, operation: &str) -> Result<CmdOutput> {
+        self.spawn(script, stdin, Privilege::Root, operation)
+    }
+
+    /// [`Host::run`] with an explicit operation description.
+    fn spawn(
+        &self,
+        cmd: &str,
+        stdin: Option<&[u8]>,
+        privilege: Privilege,
+        operation: &str,
+    ) -> Result<CmdOutput> {
+        let (program, args) = argv_for(cmd, privilege, self.policy, operation)?;
+        let mut command = Command::new(&program);
+        command.args(&args);
+        let output = run_process(&mut command, stdin).map_err(|e| Error::Command {
+            command: cmd.to_string(),
+            message: format!("failed to spawn {program}: {e}"),
+        })?;
+        Ok(to_cmd_output(output))
     }
 
     /// Stdout of `cmd`, trimmed, or `None` if it could not be run or failed.
@@ -99,6 +119,7 @@ pub(crate) fn argv_for(
     cmd: &str,
     privilege: Privilege,
     policy: PrivilegePolicy,
+    operation: &str,
 ) -> Result<(String, Vec<String>)> {
     let plain = || ("sh".to_string(), vec!["-c".to_string(), cmd.to_string()]);
     match privilege {
@@ -115,7 +136,7 @@ pub(crate) fn argv_for(
             ],
         )),
         Privilege::Root => Err(Error::NeedsRoot {
-            operation: cmd.to_string(),
+            operation: operation.to_string(),
         }),
     }
 }
@@ -229,14 +250,7 @@ impl Host for LocalHost {
     }
 
     fn run(&self, cmd: &str, stdin: Option<&[u8]>, privilege: Privilege) -> Result<CmdOutput> {
-        let (program, args) = argv_for(cmd, privilege, self.policy)?;
-        let mut command = Command::new(&program);
-        command.args(&args);
-        let output = run_process(&mut command, stdin).map_err(|e| Error::Command {
-            command: cmd.to_string(),
-            message: format!("failed to spawn {program}: {e}"),
-        })?;
-        Ok(to_cmd_output(output))
+        self.spawn(cmd, stdin, privilege, &run_operation(cmd))
     }
 
     fn read_file(&self, path: &str, privilege: Privilege) -> Result<Option<Vec<u8>>> {
@@ -247,7 +261,8 @@ impl Host for LocalHost {
                 Err(e) => Err(fs_error(e, format!("read {path}"))),
             };
         }
-        let out = self.script(&read_file_script(path), None)?;
+        let operation = format!("read {path}");
+        let out = self.script(&read_file_script(path), None, &operation)?;
         if out.success() {
             return Ok(Some(out.stdout));
         }
@@ -255,7 +270,7 @@ impl Host for LocalHost {
             return Ok(None);
         }
         Err(out
-            .require_success(&format!("read {path}"))
+            .require_success(&operation)
             .expect_err("a non-zero exit cannot succeed"))
     }
 
@@ -270,8 +285,9 @@ impl Host for LocalHost {
             return atomic_write(path, contents, mode)
                 .map_err(|e| fs_error(e, format!("write {path}")));
         }
-        self.script(&write_file_script(path, mode), Some(contents))?
-            .require_success(&format!("write {path}"))?;
+        let operation = format!("write {path}");
+        self.script(&write_file_script(path, mode), Some(contents), &operation)?
+            .require_success(&operation)?;
         Ok(())
     }
 
@@ -283,7 +299,8 @@ impl Host for LocalHost {
                 Err(e) => Err(fs_error(e, format!("remove {path}"))),
             };
         }
-        let out = self.script(&remove_file_script(path), None)?;
+        let operation = format!("remove {path}");
+        let out = self.script(&remove_file_script(path), None, &operation)?;
         if out.success() {
             return Ok(true);
         }
@@ -291,7 +308,7 @@ impl Host for LocalHost {
             return Ok(false);
         }
         Err(out
-            .require_success(&format!("remove {path}"))
+            .require_success(&operation)
             .expect_err("a non-zero exit cannot succeed"))
     }
 
@@ -299,7 +316,8 @@ impl Host for LocalHost {
         if self.direct_fs(privilege) {
             return Ok(Path::new(path).exists());
         }
-        let out = self.script(&exists_script(path), None)?;
+        let operation = format!("check {path}");
+        let out = self.script(&exists_script(path), None, &operation)?;
         if out.success() {
             return Ok(true);
         }
@@ -309,7 +327,7 @@ impl Host for LocalHost {
             return Ok(false);
         }
         Err(out
-            .require_success(&format!("check {path}"))
+            .require_success(&operation)
             .expect_err("a non-zero exit cannot succeed"))
     }
 
@@ -329,11 +347,12 @@ impl Host for LocalHost {
             names.sort();
             return Ok(names);
         }
-        let out = self.script(&list_dir_script(path), None)?;
+        let operation = format!("list {path}");
+        let out = self.script(&list_dir_script(path), None, &operation)?;
         if out.code == Some(ABSENT_EXIT) {
             return Ok(Vec::new());
         }
-        let listing = out.require_success(&format!("list {path}"))?;
+        let listing = out.require_success(&operation)?;
         let mut names: Vec<String> = listing
             .lines()
             .map(str::trim)
@@ -346,10 +365,12 @@ impl Host for LocalHost {
 
     fn create_dir_all(&self, path: &str, privilege: Privilege) -> Result<()> {
         if self.direct_fs(privilege) {
-            return std::fs::create_dir_all(path).map_err(|e| fs_error(e, format!("mkdir {path}")));
+            return std::fs::create_dir_all(path)
+                .map_err(|e| fs_error(e, format!("create directory {path}")));
         }
-        self.script(&mkdir_script(path), None)?
-            .require_success(&format!("mkdir {path}"))?;
+        let operation = format!("create directory {path}");
+        self.script(&mkdir_script(path), None, &operation)?
+            .require_success(&operation)?;
         Ok(())
     }
 }
@@ -364,32 +385,101 @@ mod tests {
 
     #[test]
     fn argv_for_user_commands_uses_sh_c() {
-        let (program, args) = argv_for("echo hi", Privilege::User, policy(false, false)).unwrap();
+        let (program, args) = argv_for(
+            "echo hi",
+            Privilege::User,
+            policy(false, false),
+            "run echo hi",
+        )
+        .unwrap();
         assert_eq!(program, "sh");
         assert_eq!(args, vec!["-c", "echo hi"]);
     }
 
     #[test]
     fn argv_for_root_as_root_uses_sh_c() {
-        let (program, args) = argv_for("echo hi", Privilege::Root, policy(true, false)).unwrap();
+        let (program, args) = argv_for(
+            "echo hi",
+            Privilege::Root,
+            policy(true, false),
+            "run echo hi",
+        )
+        .unwrap();
         assert_eq!(program, "sh");
         assert_eq!(args, vec!["-c", "echo hi"]);
     }
 
     #[test]
     fn argv_for_root_with_sudo_wraps_the_shell() {
-        let (program, args) = argv_for("echo hi", Privilege::Root, policy(false, true)).unwrap();
+        let (program, args) = argv_for(
+            "echo hi",
+            Privilege::Root,
+            policy(false, true),
+            "run echo hi",
+        )
+        .unwrap();
         assert_eq!(program, "sudo");
         assert_eq!(args, vec!["-n", "--", "sh", "-c", "echo hi"]);
     }
 
     #[test]
     fn argv_for_root_without_sudo_refuses() {
-        let err = argv_for("cat /etc/shadow", Privilege::Root, policy(false, false))
-            .expect_err("must refuse");
+        let err = argv_for(
+            "cat /etc/shadow",
+            Privilege::Root,
+            policy(false, false),
+            "read /etc/shadow",
+        )
+        .expect_err("must refuse");
         match err {
-            Error::NeedsRoot { operation } => assert_eq!(operation, "cat /etc/shadow"),
+            Error::NeedsRoot { operation } => assert_eq!(operation, "read /etc/shadow"),
             other => panic!("expected NeedsRoot, got {other:?}"),
+        }
+    }
+
+    /// The refusal must name the operation, not the pinned shell script
+    /// that would have carried it out.
+    #[test]
+    fn privileged_file_ops_refuse_in_plain_words() {
+        let host = LocalHost::with_policy(policy(false, false));
+        for (result, want) in [
+            (
+                host.read_file("/etc/systemd/system/x.timer", Privilege::Root)
+                    .err(),
+                "read /etc/systemd/system/x.timer",
+            ),
+            (
+                host.write_file("/etc/cron.d/x", b"", 0o644, Privilege::Root)
+                    .err(),
+                "write /etc/cron.d/x",
+            ),
+            (
+                host.remove_file("/etc/cron.d/x", Privilege::Root).err(),
+                "remove /etc/cron.d/x",
+            ),
+            (
+                host.exists("/etc/cron.d/x", Privilege::Root).err(),
+                "check /etc/cron.d/x",
+            ),
+            (
+                host.list_dir("/etc/cron.d", Privilege::Root).err(),
+                "list /etc/cron.d",
+            ),
+            (
+                host.create_dir_all("/etc/systemd/system", Privilege::Root)
+                    .err(),
+                "create directory /etc/systemd/system",
+            ),
+            (
+                host.run("systemctl enable --now 'x.timer'", None, Privilege::Root)
+                    .err(),
+                "run systemctl enable --now 'x.timer'",
+            ),
+        ] {
+            match result.expect("must refuse") {
+                Error::NeedsRoot { operation } => assert_eq!(operation, want),
+                other => panic!("expected NeedsRoot for {want}, got {other:?}"),
+            }
         }
     }
 
