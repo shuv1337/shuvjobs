@@ -4,6 +4,8 @@
 
 use std::collections::HashSet;
 use std::io;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result};
@@ -33,13 +35,18 @@ const ABSOLUTE_FMT: &str = "%Y-%m-%d %H:%M:%S %Z";
 const ONE_SHOT_FMT: &str = "%Y-%m-%d %H:%M %Z";
 const DATE_FMT: &str = "%Y-%m-%d";
 
-/// `initial` is the first paint. If `refresh_secs` is set the TUI calls
-/// `refresh` on that interval to re-collect tasks.
+/// `initial` is the first paint. `refresh` is moved onto a background worker
+/// thread, so it must be `Send`; the event loop never calls it inline. If
+/// `refresh_secs` is set the TUI re-collects on that interval, measured from
+/// the last *completed* refresh; `r` re-collects on demand either way.
 pub struct RunOptions {
     pub initial: Vec<ScheduledTask>,
-    pub refresh: Option<Box<dyn FnMut() -> Result<Vec<ScheduledTask>>>>,
+    pub refresh: Option<RefreshFn>,
     pub refresh_secs: Option<u64>,
 }
+
+/// Collection callback. `Send` because it lives on the refresh worker thread.
+pub type RefreshFn = Box<dyn FnMut() -> Result<Vec<ScheduledTask>> + Send>;
 
 pub fn run(opts: RunOptions) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
@@ -68,6 +75,38 @@ enum Mode {
     Search,
 }
 
+/// Owns the collection closure on a background thread so an SSH round-trip
+/// never blocks the event loop. The loop sends a unit request and picks the
+/// reply up later with `try_recv`.
+struct RefreshWorker {
+    requests: Sender<()>,
+    replies: Receiver<Result<Vec<ScheduledTask>>>,
+}
+
+impl RefreshWorker {
+    fn spawn(mut refresh: RefreshFn) -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<()>();
+        let (rep_tx, rep_rx) = mpsc::channel::<Result<Vec<ScheduledTask>>>();
+        // Deliberately detached: the handle is dropped, never joined. When the
+        // App goes away `req_tx` drops, `recv` fails, and the thread ends after
+        // whatever call it is inside returns. A worker stuck in a slow SSH call
+        // is left to finish on its own after the terminal has been restored, so
+        // quitting is always immediate instead of waiting on the network.
+        thread::spawn(move || {
+            while req_rx.recv().is_ok() {
+                let result = refresh();
+                if rep_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests: req_tx,
+            replies: rep_rx,
+        }
+    }
+}
+
 struct App {
     all: Vec<ScheduledTask>,
     available_sources: Vec<TaskSourceKind>,
@@ -78,10 +117,14 @@ struct App {
     mode: Mode,
     filter_cursor: usize,
     detail_open: bool,
-    refresh: Option<Box<dyn FnMut() -> Result<Vec<ScheduledTask>>>>,
+    worker: Option<RefreshWorker>,
     refresh_secs: Option<u64>,
+    /// Start of the interval countdown: set when a refresh *completes*, so a
+    /// slow collection never queues up back-to-back refreshes.
     last_refresh: Instant,
     refreshing: bool,
+    /// First line of the last failed collection, kept until one succeeds.
+    refresh_error: Option<String>,
     quit: bool,
 }
 
@@ -102,10 +145,11 @@ impl App {
             mode: Mode::Normal,
             filter_cursor: 0,
             detail_open: false,
-            refresh: opts.refresh,
+            worker: opts.refresh.map(RefreshWorker::spawn),
             refresh_secs: opts.refresh_secs,
             last_refresh: Instant::now(),
             refreshing: false,
+            refresh_error: None,
             quit: false,
         };
         app.refilter();
@@ -181,6 +225,7 @@ impl App {
                 self.filter_cursor = 0;
             }
             KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('r') => self.request_refresh(),
             KeyCode::Char('/') => {
                 self.mode = Mode::Search;
             }
@@ -235,70 +280,75 @@ impl App {
         }
     }
 
-    /// Re-collect when the auto-refresh interval has elapsed.
-    fn maybe_refresh<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<bool>
-    where
-        B::Error: Send + Sync + 'static,
-    {
-        let Some(secs) = self.refresh_secs else {
-            return Ok(false);
-        };
-        let Some(refresh) = self.refresh.as_mut() else {
-            return Ok(false);
-        };
-        if self.last_refresh.elapsed() < StdDuration::from_secs(secs) {
-            return Ok(false);
+    /// Ask the worker to collect. Ignored when a refresh is already in
+    /// flight — one at a time keeps the reply channel unambiguous and
+    /// stops `r` mashing from queueing up SSH sessions.
+    fn request_refresh(&mut self) {
+        if self.refreshing {
+            return;
         }
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        if worker.requests.send(()).is_ok() {
+            self.refreshing = true;
+        }
+    }
 
-        // Draw the "refreshing…" indicator before the synchronous call
-        // so the user sees something during the SSH round-trip.
-        self.refreshing = true;
-        let visible = std::mem::take(&mut self.visible);
-        let all = std::mem::take(&mut self.all);
-        let sort = self.sort;
-        let filter = self.filter.clone();
-        let mode = self.mode;
-        let filter_cursor = self.filter_cursor;
-        let detail_open = self.detail_open;
-        let refreshing = self.refreshing;
-        let available_sources = self.available_sources.clone();
-        let table_state = self.table_state;
-        let now = Utc::now();
-        terminal.draw(|frame| {
-            draw_with(
-                frame,
-                &all,
-                &visible,
-                &available_sources,
-                &filter,
-                sort,
-                mode,
-                filter_cursor,
-                detail_open,
-                refreshing,
-                &mut table_state.clone(),
-                now,
-            )
-        })?;
-        // Put the moved-out fields back before the closure runs so a
-        // panic inside it doesn't leave us in a half-state.
-        self.visible = visible;
-        self.all = all;
+    /// Auto-refresh trigger: fires once `refresh_secs` have passed since the
+    /// last completed refresh.
+    fn maybe_auto_refresh(&mut self) {
+        let Some(secs) = self.refresh_secs else {
+            return;
+        };
+        if self.refreshing || self.last_refresh.elapsed() < StdDuration::from_secs(secs) {
+            return;
+        }
+        self.request_refresh();
+    }
 
-        let new_tasks = refresh()?;
-        self.all = new_tasks;
-        self.available_sources = available_sources_of(&self.all);
-        // A newly-discovered source would otherwise default to hidden
-        // because the existing toggle set doesn't list it.
-        if let Some(allowed) = &mut self.filter.allowed_sources {
-            for kind in &self.available_sources {
-                allowed.insert(*kind);
+    /// Non-blocking check for a finished collection.
+    fn poll_refresh(&mut self) {
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        match worker.replies.try_recv() {
+            Ok(result) => self.apply_refresh(result),
+            Err(TryRecvError::Empty) => {}
+            // The worker died (panicked). Stop expecting replies.
+            Err(TryRecvError::Disconnected) => {
+                self.worker = None;
+                self.refreshing = false;
             }
         }
-        self.refilter();
+    }
+
+    /// Fold a collection result into the view. A failure keeps the last good
+    /// data and only records a message, so a flaky link never blanks the table
+    /// or drops the user out of the TUI.
+    fn apply_refresh(&mut self, result: Result<Vec<ScheduledTask>>) {
         self.refreshing = false;
         self.last_refresh = Instant::now();
-        Ok(true)
+        match result {
+            Ok(tasks) => {
+                self.refresh_error = None;
+                self.all = tasks;
+                self.available_sources = available_sources_of(&self.all);
+                // A newly-discovered source would otherwise default to hidden
+                // because the existing toggle set doesn't list it.
+                if let Some(allowed) = &mut self.filter.allowed_sources {
+                    for kind in &self.available_sources {
+                        allowed.insert(*kind);
+                    }
+                }
+                self.refilter();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let first = msg.lines().next().unwrap_or("unknown error").to_string();
+                self.refresh_error = Some(first);
+            }
+        }
     }
 }
 
@@ -328,17 +378,19 @@ where
     let mut app = App::new(opts);
 
     while !app.quit {
-        let poll_for = if app.refresh_secs.is_some() {
-            StdDuration::from_millis(250)
-        } else {
-            StdDuration::from_millis(500)
-        };
-
-        app.maybe_refresh(terminal)?;
+        app.poll_refresh();
+        app.maybe_auto_refresh();
 
         let now = Utc::now();
         terminal.draw(|frame| draw_app(frame, &mut app, now))?;
 
+        // Poll briefly whenever a reply or an interval tick may be due, so the
+        // header indicator and fresh data land without waiting on a keypress.
+        let poll_for = if app.refreshing || app.refresh_secs.is_some() {
+            StdDuration::from_millis(100)
+        } else {
+            StdDuration::from_millis(500)
+        };
         if !event::poll(poll_for)? {
             continue;
         }
@@ -354,45 +406,10 @@ where
 }
 
 fn draw_app(frame: &mut Frame, app: &mut App, now: DateTime<Utc>) {
-    // Pull table_state out by clone — render_stateful_widget needs it
-    // mutably while the row builders below borrow other app fields.
-    let mut table_state = app.table_state;
-    draw_with(
-        frame,
-        &app.all,
-        &app.visible,
-        &app.available_sources,
-        &app.filter,
-        app.sort,
-        app.mode,
-        app.filter_cursor,
-        app.detail_open,
-        app.refreshing,
-        &mut table_state,
-        now,
-    );
-    app.table_state = table_state;
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_with(
-    frame: &mut Frame,
-    all: &[ScheduledTask],
-    visible: &[ScheduledTask],
-    available_sources: &[TaskSourceKind],
-    filter: &Filter,
-    sort: SortMode,
-    mode: Mode,
-    filter_cursor: usize,
-    detail_open: bool,
-    refreshing: bool,
-    table_state: &mut TableState,
-    now: DateTime<Utc>,
-) {
     let area = frame.area();
 
     // header / body / [optional bar] / footer
-    let bar_present = matches!(mode, Mode::Filter | Mode::Search);
+    let bar_present = matches!(app.mode, Mode::Filter | Mode::Search);
     let constraints: Vec<Constraint> = if bar_present {
         vec![
             Constraint::Length(1),
@@ -420,23 +437,77 @@ fn draw_with(
         (None, v[2])
     };
 
-    draw_header(frame, header_area, all.len(), visible.len(), refreshing);
-    draw_body(frame, body_area, visible, detail_open, table_state, now);
+    draw_header(
+        frame,
+        header_area,
+        app.all.len(),
+        app.visible.len(),
+        app.refreshing,
+        app.refresh_error.as_deref(),
+    );
+    // Pull table_state out by copy — render_stateful_widget needs it mutably
+    // while the row builders below borrow other app fields.
+    let mut table_state = app.table_state;
+    draw_body(
+        frame,
+        body_area,
+        &app.visible,
+        app.detail_open,
+        &mut table_state,
+        now,
+    );
+    app.table_state = table_state;
     if let Some(area) = bar_area {
-        match mode {
-            Mode::Filter => draw_filter_bar(frame, area, available_sources, filter, filter_cursor),
-            Mode::Search => draw_search_bar(frame, area, &filter.search),
+        match app.mode {
+            Mode::Filter => draw_filter_bar(
+                frame,
+                area,
+                &app.available_sources,
+                &app.filter,
+                app.filter_cursor,
+            ),
+            Mode::Search => draw_search_bar(frame, area, &app.filter.search),
             Mode::Normal => {}
         }
     }
-    draw_footer(frame, footer_area, filter, sort, available_sources);
+    draw_footer(
+        frame,
+        footer_area,
+        &app.filter,
+        app.sort,
+        &app.available_sources,
+    );
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, total: usize, shown: usize, refreshing: bool) {
-    let mut text = format!(" ShuvJobs — {shown}/{total} task(s) ");
+/// Header body, without the surrounding padding. Split out so the
+/// in-flight and failure indicators are testable without a terminal.
+fn header_text(
+    total: usize,
+    shown: usize,
+    refreshing: bool,
+    refresh_error: Option<&str>,
+) -> String {
+    let mut text = format!("ShuvJobs — {shown}/{total} task(s)");
     if refreshing {
-        text.push_str(" · refreshing… ");
+        text.push_str(" · refreshing…");
     }
+    if let Some(err) = refresh_error {
+        text.push_str(&format!(" · refresh failed: {err}"));
+    }
+    text
+}
+
+fn draw_header(
+    frame: &mut Frame,
+    area: Rect,
+    total: usize,
+    shown: usize,
+    refreshing: bool,
+    refresh_error: Option<&str>,
+) {
+    let mut text = header_text(total, shown, refreshing, refresh_error);
+    text.insert(0, ' ');
+    text.push(' ');
     let para = Paragraph::new(Line::from(text)).style(
         Style::default()
             .add_modifier(Modifier::BOLD)
@@ -646,8 +717,8 @@ fn draw_footer(
         format!(" {} ", state_parts.join(" · "))
     };
 
-    let full = "/ search · f filter · s sort · Enter detail · q quit ";
-    let narrow = "/ · f · s · q ";
+    let full = "/ search · f filter · s sort · r refresh · Enter detail · q quit ";
+    let narrow = "/ · f · s · r · q ";
     let width = area.width as usize;
     let right = if width >= left.chars().count() + full.chars().count() + 3 {
         full
@@ -1004,5 +1075,124 @@ mod tests {
         let mut app = app_with(vec![task("a", TaskSourceKind::Cron)]);
         app.handle_key(KeyCode::Char('s'));
         assert_eq!(app.sort, SortMode::NextRun);
+    }
+
+    #[test]
+    fn refresh_key_without_a_collector_is_inert() {
+        let mut app = app_with(vec![task("a", TaskSourceKind::Cron)]);
+        app.handle_key(KeyCode::Char('r'));
+        assert!(!app.refreshing, "no worker, nothing to wait for");
+    }
+
+    #[test]
+    fn refresh_key_starts_one_collection_and_ignores_the_second() {
+        // The fake collector announces each call and then parks, so the
+        // "one in flight at a time" rule is observable without timing luck.
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut app = App::new(RunOptions {
+            initial: vec![task("alpha", TaskSourceKind::Cron)],
+            refresh: Some(Box::new(move || {
+                started_tx.send(()).ok();
+                release_rx.recv().ok();
+                Ok(vec![task("alpha", TaskSourceKind::Cron)])
+            })),
+            refresh_secs: None,
+        });
+
+        app.handle_key(KeyCode::Char('r'));
+        assert!(app.refreshing);
+        started_rx
+            .recv_timeout(StdDuration::from_secs(5))
+            .expect("worker picked the request up");
+
+        app.handle_key(KeyCode::Char('r'));
+        assert!(app.refreshing);
+        app.poll_refresh();
+        assert!(app.refreshing, "no reply yet, still in flight");
+        assert_eq!(
+            started_rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "the second request was dropped, not queued"
+        );
+
+        release_tx.send(()).unwrap();
+        // The reply may not have landed on the very first poll.
+        for _ in 0..100 {
+            app.poll_refresh();
+            if !app.refreshing {
+                break;
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        assert!(!app.refreshing, "reply applied");
+        assert!(app.refresh_error.is_none());
+    }
+
+    #[test]
+    fn successful_refresh_replaces_tasks_and_clamps_the_selection() {
+        let mut app = app_with(vec![
+            task("alpha", TaskSourceKind::Cron),
+            task("bravo", TaskSourceKind::Cron),
+            task("charlie", TaskSourceKind::Cron),
+        ]);
+        app.handle_key(KeyCode::End);
+        assert_eq!(app.table_state.selected(), Some(2));
+        app.refresh_error = Some("stale".into());
+        app.refreshing = true;
+
+        app.apply_refresh(Ok(vec![
+            task("delta", TaskSourceKind::Cron),
+            task("echo", TaskSourceKind::Systemd),
+        ]));
+
+        assert!(!app.refreshing);
+        assert!(app.refresh_error.is_none(), "a success clears the error");
+        assert_eq!(app.visible.len(), 2);
+        assert_eq!(
+            app.table_state.selected(),
+            Some(1),
+            "clamped to the new len"
+        );
+        assert_eq!(
+            app.available_sources,
+            vec![TaskSourceKind::Systemd, TaskSourceKind::Cron]
+        );
+        assert!(
+            app.visible
+                .iter()
+                .any(|t| t.source == TaskSourceKind::Systemd),
+            "a source discovered by the refresh is visible, not hidden"
+        );
+    }
+
+    #[test]
+    fn failed_refresh_keeps_the_last_good_data() {
+        let mut app = app_with(vec![task("alpha", TaskSourceKind::Cron)]);
+        app.refreshing = true;
+
+        app.apply_refresh(Err(anyhow::anyhow!("ssh: connect failed\nsecond line")));
+
+        assert!(!app.refreshing);
+        assert_eq!(app.refresh_error.as_deref(), Some("ssh: connect failed"));
+        assert_eq!(app.visible.len(), 1, "old rows survive a failure");
+        assert_eq!(app.visible[0].name, "alpha");
+        assert!(!app.quit, "a refresh failure never leaves the TUI");
+
+        app.apply_refresh(Ok(vec![task("bravo", TaskSourceKind::Cron)]));
+        assert!(app.refresh_error.is_none());
+    }
+
+    #[test]
+    fn header_shows_in_flight_and_failure_state() {
+        assert_eq!(header_text(3, 2, false, None), "ShuvJobs — 2/3 task(s)");
+        assert_eq!(
+            header_text(3, 3, true, None),
+            "ShuvJobs — 3/3 task(s) · refreshing…"
+        );
+        assert_eq!(
+            header_text(3, 3, true, Some("ssh: connect failed")),
+            "ShuvJobs — 3/3 task(s) · refreshing… · refresh failed: ssh: connect failed"
+        );
     }
 }

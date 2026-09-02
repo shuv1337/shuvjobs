@@ -12,7 +12,8 @@ use shuvjobs_tui::RunOptions;
 
 use crate::remote::RemoteCollector;
 
-type RefreshFn = Box<dyn FnMut() -> Result<Vec<ScheduledTask>>>;
+/// `Send`: the TUI runs collection on a background worker thread.
+type RefreshFn = Box<dyn FnMut() -> Result<Vec<ScheduledTask>> + Send>;
 
 #[derive(Parser, Debug, Clone)]
 #[command(

@@ -39,7 +39,7 @@ hand, and reconciling the differences.
 - Detail pane with the full command, schedule expression, last status, and run duration
 - Absolute timestamps in your local timezone, with the UTC offset spelled out
 - Substring search across name and command
-- Auto-refresh on a configurable interval
+- Non-blocking auto-refresh on a configurable interval, plus manual refresh with `r`
 - Remote-host mode over SSH — no binary upload, runs the host's own commands
 - JSON export for scripting and pipelines
 - Soft-skip for unavailable subsystems (systemd on macOS, launchd on Linux, etc.)
@@ -120,6 +120,18 @@ Combine with remote mode for continuous monitoring of a server:
 shuvjobs --host user@hostname --refresh 60
 ```
 
+Collection runs on a background thread, so the table stays scrollable,
+searchable, and filterable while a refresh (including a slow SSH round-trip) is
+in flight. The header shows `refreshing…` while one is running, and the interval
+is measured from the last *completed* refresh, so refreshes never stack up.
+
+Press `r` at any time to refresh immediately — with or without `--refresh`. A
+request made while a refresh is already in flight is ignored.
+
+If a refresh fails, the last successfully collected data stays on screen and the
+header shows `refresh failed: <reason>` until the next successful refresh; the
+TUI does not exit.
+
 ## Keyboard shortcuts
 
 | Key             | Action                                        |
@@ -135,6 +147,7 @@ shuvjobs --host user@hostname --refresh 60
 | `f`             | Open the source filter bar                    |
 | `Space`         | Toggle source under cursor (in filter mode)   |
 | `s`             | Cycle sort mode                               |
+| `r`             | Refresh now                                   |
 | `/`             | Enter search mode                             |
 | `Backspace`     | Delete one character (in search mode)         |
 | `q`             | Quit                                          |
