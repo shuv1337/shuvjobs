@@ -1,8 +1,9 @@
 //! anacron adapter.
 //!
 //! `/etc/anacrontab` lines are `period delay job-id command...` where
-//! period is either days as an integer or `@monthly`. Last-run dates
-//! sit under `/var/spool/anacron/<job-id>` in `YYYYMMDD` form.
+//! period is days as an integer or one of the cronie aliases `@daily`,
+//! `@weekly`, `@monthly`, `@yearly`/`@annually`. Last-run dates sit
+//! under `/var/spool/anacron/<job-id>` in `YYYYMMDD` form.
 
 use std::fs;
 use std::path::Path;
@@ -38,6 +39,7 @@ impl AnacronAdapter {
             let schedule = match &entry.period {
                 Period::Days(n) => ScheduleType::Interval(Duration::from_secs(n * 86_400)),
                 Period::Monthly => ScheduleType::Calendar("@monthly".into()),
+                Period::Yearly => ScheduleType::Calendar("@yearly".into()),
             };
             out.push(ScheduledTask {
                 id: format!("anacron:{}", entry.job_id),
@@ -107,6 +109,22 @@ impl TaskSource for AnacronAdapter {
 enum Period {
     Days(u64),
     Monthly,
+    Yearly,
+}
+
+impl Period {
+    fn parse(token: &str) -> Option<Self> {
+        if let Some(alias) = token.strip_prefix('@') {
+            return match alias.to_ascii_lowercase().as_str() {
+                "daily" => Some(Self::Days(1)),
+                "weekly" => Some(Self::Days(7)),
+                "monthly" => Some(Self::Monthly),
+                "yearly" | "annually" => Some(Self::Yearly),
+                _ => None,
+            };
+        }
+        token.parse().ok().filter(|&n| n > 0).map(Self::Days)
+    }
 }
 
 #[derive(Debug)]
@@ -135,11 +153,7 @@ fn parse_entry(line: &str) -> Option<Entry> {
         return None;
     }
 
-    let period = if period_tok.eq_ignore_ascii_case("@monthly") {
-        Period::Monthly
-    } else {
-        Period::Days(period_tok.parse().ok()?)
-    };
+    let period = Period::parse(period_tok)?;
     let delay_minutes: u64 = delay_tok.parse().ok()?;
     Some(Entry {
         period,
@@ -149,10 +163,14 @@ fn parse_entry(line: &str) -> Option<Entry> {
     })
 }
 
-fn period_advance(schedule: &ScheduleType) -> Option<chrono::Duration> {
+/// How far anacron will wait after a recorded run before the job is due
+/// again. Calendar aliases are approximated; anacron itself only tracks
+/// whole days. Shared with the SSH bridge so both paths agree.
+pub fn period_advance(schedule: &ScheduleType) -> Option<chrono::Duration> {
     match schedule {
         ScheduleType::Interval(d) => chrono::Duration::from_std(*d).ok(),
         ScheduleType::Calendar(s) if s == "@monthly" => Some(chrono::Duration::days(30)),
+        ScheduleType::Calendar(s) if s == "@yearly" => Some(chrono::Duration::days(365)),
         _ => None,
     }
 }
@@ -236,6 +254,40 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
     #[test]
     fn parse_spool_file_rejects_garbage() {
         assert!(AnacronAdapter::parse_spool_file("not a date").is_none());
+    }
+
+    // cronie's anacron accepts these aliases alongside integer days.
+    const ALIAS_ANACRONTAB: &str = "\
+@daily   5  d-job  /usr/local/bin/daily
+@weekly  10 w-job  /usr/local/bin/weekly
+@YEARLY  15 y-job  /usr/local/bin/yearly
+@annually 15 a-job /usr/local/bin/annually
+";
+
+    #[test]
+    fn parses_period_aliases() {
+        let tasks = AnacronAdapter::parse_anacrontab(ALIAS_ANACRONTAB);
+        assert_eq!(tasks.len(), 4, "got {tasks:?}");
+        assert!(matches!(
+            tasks[0].schedule,
+            ScheduleType::Interval(d) if d == Duration::from_secs(86_400)
+        ));
+        assert!(matches!(
+            tasks[1].schedule,
+            ScheduleType::Interval(d) if d == Duration::from_secs(7 * 86_400)
+        ));
+        assert!(matches!(tasks[2].schedule, ScheduleType::Calendar(ref s) if s == "@yearly"));
+        assert!(matches!(tasks[3].schedule, ScheduleType::Calendar(ref s) if s == "@yearly"));
+        assert_eq!(
+            period_advance(&tasks[2].schedule),
+            Some(chrono::Duration::days(365))
+        );
+    }
+
+    #[test]
+    fn rejects_zero_day_period() {
+        let tasks = AnacronAdapter::parse_anacrontab("0 5 job /bin/true\n");
+        assert!(tasks.is_empty());
     }
 
     #[test]

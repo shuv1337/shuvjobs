@@ -185,10 +185,15 @@ impl TaskSource for CronAdapter {
             let users = fs::read_to_string("/etc/passwd")
                 .map(|p| Self::parse_passwd(&p))
                 .unwrap_or_default();
+            let current = current_username();
             for user in users {
-                // crontab -l fails for users without a crontab or when
-                // we lack privilege; skip silently in either case.
-                let Ok(out) = Command::new("crontab").args(["-l", "-u", &user]).output() else {
+                // `crontab -u` is root-only (cronie and Vixie both refuse
+                // it for unprivileged callers, even for yourself), so the
+                // invoking user's own crontab must be read with plain
+                // `crontab -l`. Other users' crontabs fail silently
+                // without privilege; skip them in that case.
+                let args = crontab_list_args(&user, current.as_deref());
+                let Ok(out) = Command::new("crontab").args(&args).output() else {
                     continue;
                 };
                 if !out.status.success() {
@@ -276,6 +281,23 @@ fn parse_five_field_line(line: &str, has_user_field: bool) -> Option<(String, St
         return None;
     }
     Some((schedule_tokens.join(" "), command.to_string()))
+}
+
+/// Arguments for listing `user`'s crontab: plain `-l` when it is the
+/// invoking user, `-l -u <user>` (root-only) otherwise.
+pub fn crontab_list_args(user: &str, current: Option<&str>) -> Vec<String> {
+    if current == Some(user) {
+        vec!["-l".into()]
+    } else {
+        vec!["-l".into(), "-u".into(), user.into()]
+    }
+}
+
+fn current_username() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn command_basename(cmd: &str) -> String {
@@ -465,6 +487,16 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/false
     fn parse_passwd_keeps_only_login_shells() {
         let users = CronAdapter::parse_passwd(PASSWD_FIXTURE);
         assert_eq!(users, vec!["root", "alice"]);
+    }
+
+    #[test]
+    fn crontab_list_args_uses_plain_list_for_current_user() {
+        assert_eq!(crontab_list_args("alice", Some("alice")), vec!["-l"]);
+        assert_eq!(
+            crontab_list_args("bob", Some("alice")),
+            vec!["-l", "-u", "bob"]
+        );
+        assert_eq!(crontab_list_args("bob", None), vec!["-l", "-u", "bob"]);
     }
 
     #[test]

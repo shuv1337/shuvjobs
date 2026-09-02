@@ -11,14 +11,17 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{Datelike, FixedOffset, TimeZone, Utc};
 use shuvjobs_adapters::{
-    launchd::LaunchctlEntry, AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter,
+    anacron::period_advance as anacron_period_advance,
+    cron::crontab_list_args,
+    launchd::LaunchctlEntry,
+    systemd::{SERVICE_SHOW_PROPERTIES, TIMER_SHOW_PROPERTIES},
+    AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter,
 };
-use shuvjobs_core::{ScheduleType, ScheduledTask, TaskStatus};
+use shuvjobs_core::{ScheduledTask, TaskStatus};
 
 /// Cap below sshd's default `MaxSessions` (10) so we never get refused
 /// channels on the remote side, even on the worst case of many small
@@ -26,8 +29,10 @@ use shuvjobs_core::{ScheduleType, ScheduledTask, TaskStatus};
 const REMOTE_PARALLELISM: usize = 8;
 
 /// Construct once per `--host` invocation and reuse for the lifetime of
-/// the run — the control socket lives across `run_command` calls.
-#[derive(Debug, Clone)]
+/// the run — the multiplex master opened by the first `run_command`
+/// stays up across `collect` calls (so `--refresh` never re-handshakes)
+/// and is torn down when the collector is dropped.
+#[derive(Debug)]
 pub struct RemoteCollector {
     pub host: String,
     pub port: Option<u16>,
@@ -192,7 +197,6 @@ impl RemoteCollector {
             }
         }
 
-        self.close();
         Ok(tasks)
     }
 
@@ -228,15 +232,13 @@ impl RemoteCollector {
 
         let results: Vec<(Option<String>, Option<String>)> =
             parallel_map(&work, REMOTE_PARALLELISM, |(unit_id, service)| {
-                let timer_text = optional_remote_output(self.run_command(&format!(
-                    "systemctl show {} --property=TimersCalendar,TimersMonotonic,Result --no-pager",
-                    shell_quote(unit_id)
-                )));
+                let timer_text = optional_remote_output(
+                    self.run_command(&systemctl_show_cmd(unit_id, TIMER_SHOW_PROPERTIES)),
+                );
                 let service_text = if !service.is_empty() {
-                    optional_remote_output(self.run_command(&format!(
-                        "systemctl show {} --property=ExecStart --no-pager",
-                        shell_quote(service)
-                    )))
+                    optional_remote_output(
+                        self.run_command(&systemctl_show_cmd(service, SERVICE_SHOW_PROPERTIES)),
+                    )
                 } else {
                     Ok(None)
                 };
@@ -246,12 +248,8 @@ impl RemoteCollector {
             .map(|(timer, service)| Ok((timer?, service?)))
             .collect::<std::result::Result<Vec<_>, RemoteSourceError>>()?;
 
-        for (i, (timer_text, service_text)) in results.into_iter().enumerate() {
-            apply_systemd_show(
-                &mut tasks[i],
-                timer_text.as_deref(),
-                service_text.as_deref(),
-            );
+        for (task, (timer_text, service_text)) in tasks.iter_mut().zip(results) {
+            SystemdAdapter::apply_show(task, timer_text.as_deref(), service_text.as_deref());
         }
 
         Ok(tasks)
@@ -333,6 +331,7 @@ impl RemoteCollector {
             if let Some(passwd) =
                 optional_remote_output(self.run_command("cat /etc/passwd 2>/dev/null"))?
             {
+                let current = remote_current_user(&mut |cmd| self.run_command(cmd))?;
                 let users: Vec<String> = CronAdapter::parse_passwd(&passwd)
                     .into_iter()
                     .filter(|u| shell_safe_username(u))
@@ -341,7 +340,7 @@ impl RemoteCollector {
                     String,
                     std::result::Result<Option<String>, RemoteSourceError>,
                 )> = parallel_map(&users, REMOTE_PARALLELISM, |user| {
-                    let cmd = format!("crontab -l -u {user} 2>/dev/null");
+                    let cmd = crontab_list_cmd(user, current.as_deref());
                     (user.clone(), optional_remote_output(self.run_command(&cmd)))
                 });
                 for (user, content) in user_results {
@@ -424,14 +423,51 @@ impl RemoteCollector {
         Ok(tasks)
     }
 
-    /// Best-effort teardown of the multiplex master.
+    /// Best-effort teardown of the multiplex master. Safe to call more
+    /// than once; a no-op when no master was ever established.
     fn close(&self) {
+        if !self.control_path.exists() {
+            return;
+        }
         let mut args = self.ssh_options();
         args.push("-O".into());
         args.push("exit".into());
         args.push(self.host.clone());
         let _ = Command::new("ssh").args(args).output();
     }
+}
+
+impl Drop for RemoteCollector {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+fn systemctl_show_cmd(unit: &str, properties: &str) -> String {
+    format!(
+        "systemctl show {} --property={properties} --no-pager",
+        shell_quote(unit)
+    )
+}
+
+/// `crontab -l` for the SSH login user, `crontab -l -u <user>` (root-only)
+/// for everyone else. Usernames are pre-filtered by `shell_safe_username`.
+fn crontab_list_cmd(user: &str, current: Option<&str>) -> String {
+    format!(
+        "crontab {} 2>/dev/null",
+        crontab_list_args(user, current).join(" ")
+    )
+}
+
+/// Username the SSH session runs as, so the bridge knows which crontab
+/// to read without `-u`. `None` if `id` is unavailable or unsafe.
+fn remote_current_user<F>(run: &mut F) -> std::result::Result<Option<String>, RemoteSourceError>
+where
+    F: FnMut(&str) -> std::result::Result<String, RemoteCmdError>,
+{
+    Ok(optional_remote_output(run("id -un 2>/dev/null"))?
+        .map(|s| s.trim().to_string())
+        .filter(|s| shell_safe_username(s)))
 }
 
 /// Split out so we can unit-test without spawning a process.
@@ -522,33 +558,14 @@ where
 
     // show errors are non-fatal — keep the task with what list-timers gave us.
     for task in &mut tasks {
-        let timer_cmd = format!(
-            "systemctl show {} --property=TimersCalendar,TimersMonotonic,Result --no-pager",
-            shell_quote(&task.id)
-        );
-        if let Ok(text) = run(&timer_cmd) {
-            let timer = SystemdAdapter::parse_show_timer(&text);
-            if let Some(expr) = timer.on_calendar {
-                task.schedule = ScheduleType::Calendar(expr);
-            } else if let Some(d) = timer.on_interval {
-                task.schedule = ScheduleType::Interval(d);
-            }
-            task.last_status = timer.result.map(map_systemd_result);
-        }
-
+        let timer_text = run(&systemctl_show_cmd(&task.id, TIMER_SHOW_PROPERTIES)).ok();
         let service = task.command.clone();
-        if !service.is_empty() {
-            let svc_cmd = format!(
-                "systemctl show {} --property=ExecStart --no-pager",
-                shell_quote(&service)
-            );
-            if let Ok(text) = run(&svc_cmd) {
-                let svc = SystemdAdapter::parse_show_service(&text);
-                if let Some(c) = svc.exec_start {
-                    task.command = c;
-                }
-            }
-        }
+        let service_text = if service.is_empty() {
+            None
+        } else {
+            run(&systemctl_show_cmd(&service, SERVICE_SHOW_PROPERTIES)).ok()
+        };
+        SystemdAdapter::apply_show(task, timer_text.as_deref(), service_text.as_deref());
     }
 
     Ok(tasks)
@@ -603,11 +620,12 @@ where
     if run("command -v crontab >/dev/null 2>&1").is_ok() {
         any_present = true;
         if let Ok(passwd) = run("cat /etc/passwd 2>/dev/null") {
+            let current = remote_current_user(run)?;
             for user in CronAdapter::parse_passwd(&passwd) {
                 if !shell_safe_username(&user) {
                     continue;
                 }
-                let cmd = format!("crontab -l -u {user} 2>/dev/null");
+                let cmd = crontab_list_cmd(&user, current.as_deref());
                 if let Ok(text) = run(&cmd) {
                     if !text.is_empty() {
                         tasks.extend(CronAdapter::parse_crontab(
@@ -751,22 +769,6 @@ where
     Ok(tasks)
 }
 
-fn map_systemd_result(s: String) -> TaskStatus {
-    match s.as_str() {
-        "success" => TaskStatus::Success,
-        other => TaskStatus::Failed(other.to_string()),
-    }
-}
-
-// Mirror of the private helper in `shuvjobs-adapters::anacron`.
-fn anacron_period_advance(schedule: &ScheduleType) -> Option<chrono::Duration> {
-    match schedule {
-        ScheduleType::Interval(d) => chrono::Duration::from_std(*d).ok(),
-        ScheduleType::Calendar(s) if s == "@monthly" => Some(chrono::Duration::days(30)),
-        _ => None,
-    }
-}
-
 /// POSIX-safe single-quoting: wraps `s` in `'...'` and escapes any
 /// embedded `'` by closing the literal, inserting `\'`, and reopening.
 fn shell_quote(s: &str) -> String {
@@ -785,10 +787,6 @@ fn shell_safe_filename(s: &str) -> bool {
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
-
-// Keeps `chrono::Duration` referenced from this module even if the
-// dead-code helper above gets eliminated in some build profile.
-const _: Option<Duration> = None;
 
 /// Map `f` over `items` with up to `max_parallel` workers in flight,
 /// preserving input order. Built on `thread::scope` so the closure can
@@ -826,30 +824,6 @@ where
         .collect()
 }
 
-/// Merge `systemctl show <timer>` and `systemctl show <service>`
-/// outputs onto an already-parsed task.
-fn apply_systemd_show(
-    task: &mut ScheduledTask,
-    timer_text: Option<&str>,
-    service_text: Option<&str>,
-) {
-    if let Some(text) = timer_text {
-        let timer = SystemdAdapter::parse_show_timer(text);
-        if let Some(expr) = timer.on_calendar {
-            task.schedule = ScheduleType::Calendar(expr);
-        } else if let Some(d) = timer.on_interval {
-            task.schedule = ScheduleType::Interval(d);
-        }
-        task.last_status = timer.result.map(map_systemd_result);
-    }
-    if let Some(text) = service_text {
-        let svc = SystemdAdapter::parse_show_service(text);
-        if let Some(c) = svc.exec_start {
-            task.command = c;
-        }
-    }
-}
-
 /// Merge `launchctl list` runtime state onto a plist-parsed task.
 fn apply_launchctl_runtime(task: &mut ScheduledTask, entry: Option<&LaunchctlEntry>) {
     let Some(rt) = entry else { return };
@@ -868,6 +842,7 @@ fn apply_launchctl_runtime(task: &mut ScheduledTask, entry: Option<&LaunchctlEnt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shuvjobs_core::ScheduleType;
     use std::collections::HashMap;
 
     fn collector() -> RemoteCollector {
@@ -997,8 +972,14 @@ mod tests {
     const SYSTEMD_SHOW_TIMER: &str =
         "TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Sat 2026-04-11 17:04:57 +03 }\n\
          Result=success\n";
-    const SYSTEMD_SHOW_SERVICE: &str =
-        "ExecStart={ path=/usr/sbin/logrotate ; argv[]=/usr/sbin/logrotate /etc/logrotate.conf ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n";
+    const SYSTEMD_SHOW_SERVICE: &str = "\
+ExecStart={ path=/usr/sbin/logrotate ; argv[]=/usr/sbin/logrotate /etc/logrotate.conf ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Result=success
+ActiveState=inactive
+SubState=dead
+ExecMainStartTimestampMonotonic=40202351753
+ExecMainExitTimestampMonotonic=40202376368
+";
 
     #[test]
     fn systemd_via_runs_full_pipeline() {
@@ -1016,7 +997,7 @@ mod tests {
             SYSTEMD_SHOW_TIMER,
         );
         fx.insert(
-            "systemctl show 'logrotate.service' --property=ExecStart --no-pager",
+            "systemctl show 'logrotate.service' --property=ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
             SYSTEMD_SHOW_SERVICE,
         );
         let mut run = router(fx);
@@ -1028,6 +1009,54 @@ mod tests {
         assert_eq!(t.command, "/usr/sbin/logrotate /etc/logrotate.conf");
         assert!(matches!(t.schedule, ScheduleType::Calendar(ref s) if s == "*-*-* 00:00:00"));
         assert!(matches!(t.last_status, Some(TaskStatus::Success)));
+        assert_eq!(
+            t.last_duration,
+            Some(std::time::Duration::from_micros(24_615))
+        );
+    }
+
+    #[test]
+    fn cron_via_reads_own_crontab_without_dash_u() {
+        let mut fx = HashMap::new();
+        fx.insert("command -v crontab >/dev/null 2>&1", "");
+        fx.insert("id -un 2>/dev/null", "alice\n");
+        fx.insert(
+            "cat /etc/passwd 2>/dev/null",
+            "root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1000::/home/alice:/bin/zsh\n",
+        );
+        fx.insert(
+            "crontab -l 2>/dev/null",
+            "0 9 * * 1-5 /home/alice/bin/standup\n",
+        );
+        // root's crontab is unreadable as alice: router returns Failed{1}.
+        let mut run = router(fx);
+        let tasks = collect_cron_via(&mut run).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "user:alice:1");
+        assert_eq!(tasks[0].command, "/home/alice/bin/standup");
+    }
+
+    #[test]
+    fn crontab_list_cmd_shapes() {
+        assert_eq!(
+            crontab_list_cmd("alice", Some("alice")),
+            "crontab -l 2>/dev/null"
+        );
+        assert_eq!(
+            crontab_list_cmd("bob", Some("alice")),
+            "crontab -l -u bob 2>/dev/null"
+        );
+    }
+
+    #[test]
+    fn remote_current_user_rejects_unsafe_names() {
+        let mut run = |_: &str| Ok("evil; rm -rf /\n".to_string());
+        assert_eq!(remote_current_user(&mut run).unwrap(), None);
+        let mut run = |_: &str| Ok("alice\n".to_string());
+        assert_eq!(
+            remote_current_user(&mut run).unwrap(),
+            Some("alice".to_string())
+        );
     }
 
     #[test]
@@ -1242,50 +1271,6 @@ mod tests {
             elapsed < std::time::Duration::from_millis(500),
             "expected parallel speedup, took {elapsed:?}"
         );
-    }
-
-    fn empty_systemd_task() -> ScheduledTask {
-        ScheduledTask {
-            id: "logrotate.timer".into(),
-            name: "logrotate".into(),
-            source: shuvjobs_core::TaskSourceKind::Systemd,
-            schedule: ScheduleType::Calendar(String::new()),
-            last_run: None,
-            last_status: None,
-            last_duration: None,
-            next_run: None,
-            command: "logrotate.service".into(),
-        }
-    }
-
-    #[test]
-    fn apply_systemd_show_merges_calendar_status_and_command() {
-        let mut task = empty_systemd_task();
-        apply_systemd_show(
-            &mut task,
-            Some(SYSTEMD_SHOW_TIMER),
-            Some(SYSTEMD_SHOW_SERVICE),
-        );
-        assert!(matches!(task.schedule, ScheduleType::Calendar(ref s) if s == "*-*-* 00:00:00"));
-        assert!(matches!(task.last_status, Some(TaskStatus::Success)));
-        assert_eq!(task.command, "/usr/sbin/logrotate /etc/logrotate.conf");
-    }
-
-    #[test]
-    fn apply_systemd_show_no_op_when_both_inputs_none() {
-        let mut task = empty_systemd_task();
-        let snapshot = task.clone();
-        apply_systemd_show(&mut task, None, None);
-        assert_eq!(task, snapshot);
-    }
-
-    #[test]
-    fn apply_systemd_show_skips_service_merge_when_service_is_empty() {
-        let mut task = empty_systemd_task();
-        task.command = String::new();
-        apply_systemd_show(&mut task, Some(SYSTEMD_SHOW_TIMER), None);
-        assert_eq!(task.command, "");
-        assert!(matches!(task.schedule, ScheduleType::Calendar(_)));
     }
 
     fn empty_launchd_task() -> ScheduledTask {

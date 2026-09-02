@@ -2,7 +2,12 @@
 //!
 //! `systemctl list-timers` gives us the next/last instants and the bound
 //! service. We then `systemctl show` each timer for `OnCalendar=` /
-//! `OnUnitActiveSec=` / `Result=` and the bound service for `ExecStart=`.
+//! `OnUnitActiveSec=` and the bound service for `ExecStart=`, `Result=`,
+//! `ActiveState=`/`SubState=`, and the main-process timestamps.
+//!
+//! Status deliberately comes from the *service*, not the timer: a timer
+//! unit's own `Result=` stays `success` even when every activation of
+//! the service it fires has failed.
 
 use std::process::Command;
 use std::time::Duration;
@@ -98,24 +103,99 @@ impl SystemdAdapter {
         out
     }
 
-    /// Parse `systemctl show <service> --property=ExecStart`, returning the argv portion.
+    /// Parse `systemctl show <service> --property=<SERVICE_SHOW_PROPERTIES>`.
     pub fn parse_show_service(text: &str) -> ShowService {
         let mut out = ShowService::default();
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            if key == "ExecStart" {
+            match key {
                 // value: { path=...; argv[]=... ; ignore_errors=no ; ... }
-                if let Some(argv) = extract_property_subfield(value, "argv[]=") {
-                    if out.exec_start.is_none() {
-                        out.exec_start = Some(argv);
+                "ExecStart" => {
+                    if let Some(argv) = extract_property_subfield(value, "argv[]=") {
+                        if out.exec_start.is_none() {
+                            out.exec_start = Some(argv);
+                        }
                     }
                 }
+                "Result" if !value.is_empty() => out.result = Some(value.to_string()),
+                "ActiveState" if !value.is_empty() => out.active_state = Some(value.to_string()),
+                "SubState" if !value.is_empty() => out.sub_state = Some(value.to_string()),
+                "ExecMainStartTimestampMonotonic" => {
+                    out.main_start_us = value.trim().parse().ok().filter(|&us: &u64| us > 0);
+                }
+                "ExecMainExitTimestampMonotonic" => {
+                    out.main_exit_us = value.trim().parse().ok().filter(|&us: &u64| us > 0);
+                }
+                _ => {}
             }
         }
         out
     }
+
+    /// Merge `systemctl show <timer>` and `systemctl show <service>` output
+    /// onto a task produced by [`SystemdAdapter::parse_list_timers`].
+    /// Either input may be absent; the task keeps whatever it already had.
+    pub fn apply_show(
+        task: &mut ScheduledTask,
+        timer_text: Option<&str>,
+        service_text: Option<&str>,
+    ) {
+        let timer = timer_text.map(Self::parse_show_timer);
+        let service = service_text.map(Self::parse_show_service);
+
+        if let Some(timer) = &timer {
+            if let Some(expr) = &timer.on_calendar {
+                task.schedule = ScheduleType::Calendar(expr.clone());
+            } else if let Some(d) = timer.on_interval {
+                task.schedule = ScheduleType::Interval(d);
+            }
+        }
+
+        if let Some(service) = &service {
+            if let Some(cmd) = &service.exec_start {
+                task.command = cmd.clone();
+            }
+            task.last_duration = service.main_duration();
+        }
+
+        task.last_status = derive_status(timer.as_ref(), service.as_ref(), task.last_run.is_some());
+    }
+}
+
+/// Properties requested from the bound service. Kept in one place so the
+/// local adapter and the SSH bridge issue the identical `systemctl show`.
+pub const SERVICE_SHOW_PROPERTIES: &str = "ExecStart,Result,ActiveState,SubState,\
+ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic";
+
+/// Properties requested from the timer unit itself.
+pub const TIMER_SHOW_PROPERTIES: &str = "TimersCalendar,TimersMonotonic,Result";
+
+/// Service state wins; the timer's own `Result=` is only a fallback when
+/// we could not inspect the service at all. A service that has never
+/// been triggered reports `Result=success` too, so with no last run and
+/// a clean result we report nothing rather than a misleading check mark.
+fn derive_status(
+    timer: Option<&ShowTimer>,
+    service: Option<&ShowService>,
+    has_last_run: bool,
+) -> Option<TaskStatus> {
+    if let Some(service) = service {
+        if service.is_running() {
+            return Some(TaskStatus::Running);
+        }
+        if let Some(result) = &service.result {
+            if result == "success" && !has_last_run && service.main_exit_us.is_none() {
+                return None;
+            }
+            return Some(map_result(result.clone()));
+        }
+    }
+    timer
+        .and_then(|t| t.result.clone())
+        .filter(|_| has_last_run)
+        .map(map_result)
 }
 
 impl TaskSource for SystemdAdapter {
@@ -152,28 +232,14 @@ impl TaskSource for SystemdAdapter {
         let mut tasks = Self::parse_list_timers(&stdout)?;
 
         for task in &mut tasks {
-            // Enrich with timer-side schedule + last result.
-            if let Some(text) = run_show(&task.id, &["TimersCalendar", "TimersMonotonic", "Result"])
-            {
-                let timer = Self::parse_show_timer(&text);
-                if let Some(expr) = timer.on_calendar {
-                    task.schedule = ScheduleType::Calendar(expr);
-                } else if let Some(d) = timer.on_interval {
-                    task.schedule = ScheduleType::Interval(d);
-                }
-                task.last_status = timer.result.map(map_result);
-            }
-
-            // Enrich with the bound service's command line.
+            let timer_text = run_show(&task.id, TIMER_SHOW_PROPERTIES);
             let service = task.command.clone();
-            if !service.is_empty() {
-                if let Some(text) = run_show(&service, &["ExecStart"]) {
-                    let svc = Self::parse_show_service(&text);
-                    if let Some(cmd) = svc.exec_start {
-                        task.command = cmd;
-                    }
-                }
-            }
+            let service_text = if service.is_empty() {
+                None
+            } else {
+                run_show(&service, SERVICE_SHOW_PROPERTIES)
+            };
+            Self::apply_show(task, timer_text.as_deref(), service_text.as_deref());
         }
 
         Ok(tasks)
@@ -190,10 +256,37 @@ pub struct ShowTimer {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ShowService {
     pub exec_start: Option<String>,
+    /// `Result=` of the service: `success`, `exit-code`, `signal`,
+    /// `timeout`, `oom-kill`, `start-limit-hit`, ...
+    pub result: Option<String>,
+    pub active_state: Option<String>,
+    pub sub_state: Option<String>,
+    /// `ExecMainStartTimestampMonotonic` / `ExecMainExitTimestampMonotonic`
+    /// in microseconds since boot; `None` when systemd reports `0`.
+    pub main_start_us: Option<u64>,
+    pub main_exit_us: Option<u64>,
 }
 
-fn run_show(unit: &str, properties: &[&str]) -> Option<String> {
-    let prop_arg = format!("--property={}", properties.join(","));
+impl ShowService {
+    /// `activating` covers oneshot services mid-run; `active`+`running`
+    /// covers simple services. `active`+`exited` (RemainAfterExit) is
+    /// finished, not running.
+    pub fn is_running(&self) -> bool {
+        matches!(
+            (self.active_state.as_deref(), self.sub_state.as_deref()),
+            (Some("activating"), _) | (Some("deactivating"), _) | (Some("active"), Some("running"))
+        )
+    }
+
+    /// Wall time of the last main-process run, when both stamps are set.
+    pub fn main_duration(&self) -> Option<Duration> {
+        let (start, exit) = (self.main_start_us?, self.main_exit_us?);
+        (exit >= start).then(|| Duration::from_micros(exit - start))
+    }
+}
+
+fn run_show(unit: &str, properties: &str) -> Option<String> {
+    let prop_arg = format!("--property={properties}");
     let out = Command::new("systemctl")
         .args(["show", unit, &prop_arg, "--no-pager"])
         .output()
@@ -425,6 +518,118 @@ mod tests {
             parsed.exec_start.as_deref(),
             Some("/usr/sbin/logrotate /etc/logrotate.conf")
         );
+        assert!(parsed.result.is_none());
+        assert!(parsed.main_duration().is_none());
+    }
+
+    // Captured from `systemctl show snapper-cleanup.service` after a
+    // successful oneshot run: 24.6ms between main-process start and exit.
+    const SHOW_SERVICE_FULL: &str = "\
+ExecStart={ path=/usr/lib/snapper/systemd-helper ; argv[]=/usr/lib/snapper/systemd-helper --cleanup ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Result=success
+ActiveState=inactive
+SubState=dead
+ExecMainStartTimestampMonotonic=40202351753
+ExecMainExitTimestampMonotonic=40202376368
+";
+
+    #[test]
+    fn parse_show_service_reads_result_state_and_timestamps() {
+        let parsed = SystemdAdapter::parse_show_service(SHOW_SERVICE_FULL);
+        assert_eq!(parsed.result.as_deref(), Some("success"));
+        assert_eq!(parsed.active_state.as_deref(), Some("inactive"));
+        assert_eq!(parsed.sub_state.as_deref(), Some("dead"));
+        assert_eq!(parsed.main_duration(), Some(Duration::from_micros(24_615)));
+        assert!(!parsed.is_running());
+    }
+
+    #[test]
+    fn parse_show_service_treats_zero_timestamps_as_absent() {
+        let text = "ExecMainStartTimestampMonotonic=0\nExecMainExitTimestampMonotonic=0\n";
+        let parsed = SystemdAdapter::parse_show_service(text);
+        assert!(parsed.main_start_us.is_none());
+        assert!(parsed.main_duration().is_none());
+    }
+
+    fn listed_task(last_run: bool) -> ScheduledTask {
+        ScheduledTask {
+            id: "logrotate.timer".into(),
+            name: "logrotate".into(),
+            source: TaskSourceKind::Systemd,
+            schedule: ScheduleType::Calendar(String::new()),
+            last_run: last_run.then(|| Utc.timestamp_opt(1_775_499_594, 0).single().unwrap()),
+            last_status: None,
+            last_duration: None,
+            next_run: None,
+            command: "logrotate.service".into(),
+        }
+    }
+
+    #[test]
+    fn apply_show_merges_calendar_command_status_and_duration() {
+        let mut task = listed_task(true);
+        SystemdAdapter::apply_show(&mut task, Some(SHOW_TIMER_SUCCESS), Some(SHOW_SERVICE_FULL));
+        assert!(matches!(task.schedule, ScheduleType::Calendar(ref s) if s == "*-*-* 00:00:00"));
+        assert_eq!(task.command, "/usr/lib/snapper/systemd-helper --cleanup");
+        assert_eq!(task.last_status, Some(TaskStatus::Success));
+        assert_eq!(task.last_duration, Some(Duration::from_micros(24_615)));
+    }
+
+    /// The whole point of reading the service: a failed activation must
+    /// surface even though the timer unit itself still says `success`.
+    #[test]
+    fn apply_show_reports_service_failure_over_timer_success() {
+        let service = "Result=exit-code\nActiveState=failed\nSubState=failed\n";
+        let mut task = listed_task(true);
+        SystemdAdapter::apply_show(&mut task, Some(SHOW_TIMER_SUCCESS), Some(service));
+        assert_eq!(
+            task.last_status,
+            Some(TaskStatus::Failed("exit-code".into()))
+        );
+    }
+
+    #[test]
+    fn apply_show_reports_running_for_activating_oneshot() {
+        let service = "Result=success\nActiveState=activating\nSubState=start\n";
+        let mut task = listed_task(true);
+        SystemdAdapter::apply_show(&mut task, None, Some(service));
+        assert_eq!(task.last_status, Some(TaskStatus::Running));
+    }
+
+    #[test]
+    fn apply_show_remain_after_exit_is_not_running() {
+        let service = "Result=success\nActiveState=active\nSubState=exited\n";
+        let mut task = listed_task(true);
+        SystemdAdapter::apply_show(&mut task, None, Some(service));
+        assert_eq!(task.last_status, Some(TaskStatus::Success));
+    }
+
+    #[test]
+    fn apply_show_never_triggered_service_has_no_status() {
+        let service = "Result=success\nActiveState=inactive\nSubState=dead\n\
+                       ExecMainStartTimestampMonotonic=0\nExecMainExitTimestampMonotonic=0\n";
+        let mut task = listed_task(false);
+        SystemdAdapter::apply_show(&mut task, Some(SHOW_TIMER_SUCCESS), Some(service));
+        assert_eq!(task.last_status, None);
+    }
+
+    #[test]
+    fn apply_show_falls_back_to_timer_result_without_service() {
+        let mut task = listed_task(true);
+        SystemdAdapter::apply_show(&mut task, Some(SHOW_TIMER_FAILED), None);
+        assert_eq!(task.last_status, Some(TaskStatus::Failed("failed".into())));
+
+        let mut never = listed_task(false);
+        SystemdAdapter::apply_show(&mut never, Some(SHOW_TIMER_SUCCESS), None);
+        assert_eq!(never.last_status, None);
+    }
+
+    #[test]
+    fn apply_show_is_no_op_without_inputs() {
+        let mut task = listed_task(true);
+        let snapshot = task.clone();
+        SystemdAdapter::apply_show(&mut task, None, None);
+        assert_eq!(task, snapshot);
     }
 
     #[test]

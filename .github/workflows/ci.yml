@@ -38,6 +38,19 @@ jobs:
       - name: Check crate packages
         run: cargo package --workspace --locked --no-verify
 
+  msrv:
+    name: Check MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install minimum supported Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+
   security:
     runs-on: ubuntu-latest
     steps:

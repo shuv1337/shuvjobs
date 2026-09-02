@@ -9,7 +9,7 @@ use std::time::{Duration as StdDuration, Instant};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -37,7 +37,9 @@ pub struct RunOptions {
 pub fn run(opts: RunOptions) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alt screen")?;
+    // No mouse capture: the TUI is keyboard-driven, and leaving the
+    // mouse alone keeps terminal-native text selection and copy working.
+    execute!(stdout, EnterAlternateScreen).context("enter alt screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("init terminal")?;
 
@@ -45,18 +47,13 @@ pub fn run(opts: RunOptions) -> Result<()> {
 
     // Restore the terminal even when the loop bailed.
     disable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
 
     result
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Mode {
     #[default]
     Normal,
@@ -719,5 +716,196 @@ fn human_duration(d: std::time::Duration) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{}s", secs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::time::Duration;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs, 0).single().unwrap()
+    }
+
+    fn task(name: &str, source: TaskSourceKind) -> ScheduledTask {
+        ScheduledTask {
+            id: name.into(),
+            name: name.into(),
+            source,
+            schedule: ScheduleType::Cron("* * * * *".into()),
+            last_run: None,
+            last_status: None,
+            last_duration: None,
+            next_run: None,
+            command: String::new(),
+        }
+    }
+
+    #[test]
+    fn relative_times_scale_by_magnitude() {
+        let now = at(1_000_000);
+        assert_eq!(format_relative(at(1_000_030), now), "in 30s");
+        assert_eq!(format_relative(at(1_000_000 - 90), now), "1m ago");
+        assert_eq!(format_relative(at(1_000_000 + 7_200), now), "in 2h");
+        assert_eq!(format_relative(at(1_000_000 - 3 * 86_400), now), "3d ago");
+        assert_eq!(format_relative(now, now), "in 0s");
+    }
+
+    #[test]
+    fn relative_times_beyond_a_month_show_the_date() {
+        let now = at(1_000_000);
+        let far = now + chrono::Duration::days(45);
+        assert_eq!(
+            format_relative(far, now),
+            far.format("%Y-%m-%d").to_string()
+        );
+    }
+
+    #[test]
+    fn optional_datetime_renders_dash_for_none() {
+        assert_eq!(format_optional_dt(None, at(0)), "-");
+    }
+
+    #[test]
+    fn human_duration_picks_largest_exact_unit() {
+        assert_eq!(human_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(human_duration(Duration::from_secs(900)), "15m");
+        assert_eq!(human_duration(Duration::from_secs(5_400)), "90m");
+        assert_eq!(human_duration(Duration::from_secs(7_200)), "2h");
+        assert_eq!(human_duration(Duration::from_secs(172_800)), "2d");
+    }
+
+    #[test]
+    fn schedule_formatting_covers_every_variant() {
+        assert_eq!(
+            format_schedule(&ScheduleType::Cron("0 2 * * *".into())),
+            "0 2 * * *"
+        );
+        assert_eq!(
+            format_schedule(&ScheduleType::Calendar(String::new())),
+            "(unknown)"
+        );
+        assert_eq!(
+            format_schedule(&ScheduleType::Calendar("daily".into())),
+            "daily"
+        );
+        assert_eq!(
+            format_schedule(&ScheduleType::Interval(Duration::from_secs(3_600))),
+            "every 1h"
+        );
+        assert_eq!(
+            format_schedule(&ScheduleType::OneShot(at(1_776_175_200))),
+            "2026-04-14 14:00"
+        );
+    }
+
+    #[test]
+    fn status_glyphs_and_long_form() {
+        assert_eq!(format_status(None), "-");
+        assert_eq!(format_status(Some(&TaskStatus::Running)), "⏳");
+        assert_eq!(
+            format_status_long(Some(&TaskStatus::Failed("exit-code".into()))),
+            "❌ Failed (exit-code)"
+        );
+        assert_eq!(
+            format_status_long(Some(&TaskStatus::Failed(String::new()))),
+            "❌ Failed"
+        );
+    }
+
+    #[test]
+    fn available_sources_are_deduped_in_canonical_order() {
+        let tasks = vec![
+            task("a", TaskSourceKind::Launchd),
+            task("b", TaskSourceKind::Cron),
+            task("c", TaskSourceKind::Cron),
+            task("d", TaskSourceKind::Systemd),
+        ];
+        assert_eq!(
+            available_sources_of(&tasks),
+            vec![
+                TaskSourceKind::Systemd,
+                TaskSourceKind::Cron,
+                TaskSourceKind::Launchd
+            ]
+        );
+        assert!(available_sources_of(&[]).is_empty());
+    }
+
+    fn app_with(tasks: Vec<ScheduledTask>) -> App {
+        App::new(RunOptions {
+            initial: tasks,
+            refresh: None,
+            refresh_secs: None,
+        })
+    }
+
+    #[test]
+    fn selection_clamps_and_search_filters() {
+        let mut app = app_with(vec![
+            task("alpha", TaskSourceKind::Cron),
+            task("bravo", TaskSourceKind::Cron),
+            task("charlie", TaskSourceKind::Systemd),
+        ]);
+        assert_eq!(app.visible.len(), 3);
+        assert_eq!(app.table_state.selected(), Some(0));
+
+        app.handle_key(KeyCode::End);
+        assert_eq!(app.table_state.selected(), Some(2));
+        app.handle_key(KeyCode::Char('j'));
+        assert_eq!(
+            app.table_state.selected(),
+            Some(2),
+            "clamped at the last row"
+        );
+        app.handle_key(KeyCode::PageUp);
+        assert_eq!(app.table_state.selected(), Some(0));
+
+        app.handle_key(KeyCode::Char('/'));
+        for c in "brav".chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+        assert_eq!(app.visible.len(), 1);
+        assert_eq!(app.visible[0].name, "bravo");
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.filter.search, "brav", "enter keeps the query");
+
+        app.handle_key(KeyCode::Char('/'));
+        app.handle_key(KeyCode::Esc);
+        assert!(app.filter.search.is_empty(), "esc clears the query");
+        assert_eq!(app.visible.len(), 3);
+    }
+
+    #[test]
+    fn filter_bar_toggles_sources_and_detail_needs_a_row() {
+        let mut app = app_with(vec![
+            task("alpha", TaskSourceKind::Systemd),
+            task("bravo", TaskSourceKind::Cron),
+        ]);
+        app.handle_key(KeyCode::Char('f'));
+        assert_eq!(app.mode, Mode::Filter);
+        // cursor 0 = systemd (canonical order); toggle it off.
+        app.handle_key(KeyCode::Char(' '));
+        assert_eq!(app.visible.len(), 1);
+        assert_eq!(app.visible[0].source, TaskSourceKind::Cron);
+        app.handle_key(KeyCode::Right);
+        app.handle_key(KeyCode::Char(' '));
+        assert!(app.visible.is_empty());
+        app.handle_key(KeyCode::Esc);
+
+        app.handle_key(KeyCode::Enter);
+        assert!(!app.detail_open, "no rows visible, so no detail pane");
+        app.handle_key(KeyCode::Char('q'));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn sort_key_cycles_and_footer_reflects_it() {
+        let mut app = app_with(vec![task("a", TaskSourceKind::Cron)]);
+        app.handle_key(KeyCode::Char('s'));
+        assert_eq!(app.sort, SortMode::NextRun);
     }
 }

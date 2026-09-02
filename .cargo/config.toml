@@ -1,9 +1,9 @@
-# Cross-compilation linkers used by `scripts/build-all.sh`.
+# Cross-compilation linkers for local `cargo build --target <triple>` runs.
 #
-# These are required so `cargo build --target <triple>` produces a working
-# binary without extra command-line flags. Toolchain installation is the
-# operator's responsibility — the build script checks for missing linkers
-# and prints a clear error rather than silently producing a broken binary.
+# CI releases (`.github/workflows/release.yml`) build the aarch64 Linux
+# target with `cross`, so this only matters for a manual cross build from
+# a workstation. Toolchain installation is the operator's responsibility;
+# a missing linker fails loudly at link time.
 
 [target.aarch64-unknown-linux-gnu]
 # Provided by the `aarch64-linux-gnu-gcc` package on Arch / CachyOS,
