@@ -5,6 +5,7 @@
 //! themselves accept: a name we generate is also a filename, a unit
 //! name, and sometimes a shell word, so it has to be safe in all three.
 
+pub mod anacron;
 pub mod calendar;
 pub mod cron;
 
@@ -24,6 +25,10 @@ pub fn writers_for(host: Arc<dyn Host>) -> HashMap<TaskSourceKind, Box<dyn JobWr
     writers.insert(
         TaskSourceKind::Cron,
         Box::new(cron::CronWriter::new(Arc::clone(&host))),
+    );
+    writers.insert(
+        TaskSourceKind::Anacron,
+        Box::new(anacron::AnacronWriter::new(Arc::clone(&host))),
     );
     writers
 }
