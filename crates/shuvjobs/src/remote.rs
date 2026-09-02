@@ -83,6 +83,23 @@ enum RemoteSourceError {
     Other(anyhow::Error),
 }
 
+/// One command execution on the remote host. Production uses
+/// [`RemoteCollector`] (an `ssh` round-trip per call); tests use a
+/// fixture-driven runner so the per-source collectors below are
+/// exercised exactly as production runs them.
+///
+/// `Sync` because the parallel collectors share a single runner across
+/// [`REMOTE_PARALLELISM`] worker threads.
+pub trait CommandRunner: Sync {
+    fn run(&self, cmd: &str) -> std::result::Result<String, RemoteCmdError>;
+}
+
+impl CommandRunner for RemoteCollector {
+    fn run(&self, cmd: &str) -> std::result::Result<String, RemoteCmdError> {
+        self.run_command(cmd)
+    }
+}
+
 impl RemoteCollector {
     pub fn new(host: String, port: Option<u16>, key_path: Option<PathBuf>) -> Self {
         let control_path =
@@ -167,14 +184,13 @@ impl RemoteCollector {
                 self.host
             ));
         };
+        let remote_now = Utc::now().with_timezone(&remote_offset);
 
-        let systemd_result = self.collect_systemd_parallel();
-        let cron_result = self.collect_cron_parallel(remote_offset);
-        let launchd_result = self.collect_launchd_parallel(remote_offset);
-
-        let mut runner = |cmd: &str| self.run_command(cmd);
-        let at_result = collect_at_via(&mut runner, &remote_offset);
-        let anacron_result = collect_anacron_via(&mut runner);
+        let systemd_result = collect_systemd(self);
+        let cron_result = collect_cron(self, remote_now);
+        let launchd_result = collect_launchd(self, remote_now);
+        let at_result = collect_at(self, &remote_offset);
+        let anacron_result = collect_anacron(self);
 
         let mut tasks: Vec<ScheduledTask> = Vec::new();
         for (label, result) in [
@@ -197,231 +213,6 @@ impl RemoteCollector {
             }
         }
 
-        Ok(tasks)
-    }
-
-    // Parallel per-source methods. The serial closure-based equivalents
-    // (`collect_<source>_via` below) still exist for fixture-driven tests.
-
-    fn collect_systemd_parallel(
-        &self,
-    ) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError> {
-        match self.run_command("command -v systemctl >/dev/null 2>&1 && echo present") {
-            Ok(s) if s.trim() == "present" => {}
-            Ok(_) => return Err(RemoteSourceError::Unavailable),
-            Err(RemoteCmdError::NotFound) | Err(RemoteCmdError::Failed { .. }) => {
-                return Err(RemoteSourceError::Unavailable);
-            }
-            Err(RemoteCmdError::Ssh(e)) => return Err(RemoteSourceError::Transport(e)),
-        }
-
-        let json = match self.run_command("systemctl list-timers --all --output=json --no-pager") {
-            Ok(s) => s,
-            Err(RemoteCmdError::NotFound) => return Err(RemoteSourceError::Unavailable),
-            Err(e) => return Err(remote_source_error("systemctl list-timers", e)),
-        };
-        let mut tasks = SystemdAdapter::parse_list_timers(&json)
-            .map_err(|e| RemoteSourceError::Other(anyhow!("parse list-timers: {e}")))?;
-
-        // Two `systemctl show` calls per timer, fanned out — 30 serial
-        // round-trips become ceil(N/8) waves of 8 in parallel.
-        let work: Vec<(String, String)> = tasks
-            .iter()
-            .map(|t| (t.id.clone(), t.command.clone()))
-            .collect();
-
-        let results: Vec<(Option<String>, Option<String>)> =
-            parallel_map(&work, REMOTE_PARALLELISM, |(unit_id, service)| {
-                let timer_text = optional_remote_output(
-                    self.run_command(&systemctl_show_cmd(unit_id, TIMER_SHOW_PROPERTIES)),
-                );
-                let service_text = if !service.is_empty() {
-                    optional_remote_output(
-                        self.run_command(&systemctl_show_cmd(service, SERVICE_SHOW_PROPERTIES)),
-                    )
-                } else {
-                    Ok(None)
-                };
-                (timer_text, service_text)
-            })
-            .into_iter()
-            .map(|(timer, service)| Ok((timer?, service?)))
-            .collect::<std::result::Result<Vec<_>, RemoteSourceError>>()?;
-
-        for (task, (timer_text, service_text)) in tasks.iter_mut().zip(results) {
-            SystemdAdapter::apply_show(task, timer_text.as_deref(), service_text.as_deref());
-        }
-
-        Ok(tasks)
-    }
-
-    fn collect_cron_parallel(
-        &self,
-        remote_offset: FixedOffset,
-    ) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError> {
-        let mut tasks = Vec::new();
-        let mut any_present = false;
-        let now = Utc::now().with_timezone(&remote_offset);
-
-        if let Some(text) =
-            optional_remote_output(self.run_command("cat /etc/crontab 2>/dev/null"))?
-        {
-            any_present = true;
-            if !text.is_empty() {
-                tasks.extend(CronAdapter::parse_crontab_at(
-                    &text,
-                    "/etc/crontab",
-                    true,
-                    now,
-                ));
-            }
-        }
-
-        // /etc/cron.d/* — list once, then cat in parallel.
-        if let Some(listing) =
-            optional_remote_output(self.run_command("ls -1 /etc/cron.d 2>/dev/null"))?
-        {
-            any_present = true;
-            let filenames: Vec<String> = listing
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
-            let cron_d_results: Vec<(
-                String,
-                std::result::Result<Option<String>, RemoteSourceError>,
-            )> = parallel_map(&filenames, REMOTE_PARALLELISM, |fname| {
-                let path = format!("/etc/cron.d/{fname}");
-                let cmd = format!("cat {} 2>/dev/null", shell_quote(&path));
-                (path, optional_remote_output(self.run_command(&cmd)))
-            });
-            for (path, content) in cron_d_results {
-                if let Some(text) = content? {
-                    tasks.extend(CronAdapter::parse_crontab_at(&text, &path, true, now));
-                }
-            }
-        }
-
-        // run-parts directories. Just 4 ls calls — keep serial.
-        for (period, dir) in [
-            ("hourly", "/etc/cron.hourly"),
-            ("daily", "/etc/cron.daily"),
-            ("weekly", "/etc/cron.weekly"),
-            ("monthly", "/etc/cron.monthly"),
-        ] {
-            let cmd = format!("ls -1 {} 2>/dev/null", shell_quote(dir));
-            if let Some(listing) = optional_remote_output(self.run_command(&cmd))? {
-                any_present = true;
-                let scripts: Vec<&str> = listing
-                    .lines()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if !scripts.is_empty() {
-                    tasks.extend(CronAdapter::parse_run_parts_at(period, &scripts, dir, now));
-                }
-            }
-        }
-
-        // Per-user crontabs in parallel.
-        if optional_remote_output(self.run_command("command -v crontab >/dev/null 2>&1"))?.is_some()
-        {
-            any_present = true;
-            if let Some(passwd) =
-                optional_remote_output(self.run_command("cat /etc/passwd 2>/dev/null"))?
-            {
-                let current = remote_current_user(&mut |cmd| self.run_command(cmd))?;
-                let users: Vec<String> = CronAdapter::parse_passwd(&passwd)
-                    .into_iter()
-                    .filter(|u| shell_safe_username(u))
-                    .collect();
-                let user_results: Vec<(
-                    String,
-                    std::result::Result<Option<String>, RemoteSourceError>,
-                )> = parallel_map(&users, REMOTE_PARALLELISM, |user| {
-                    let cmd = crontab_list_cmd(user, current.as_deref());
-                    (user.clone(), optional_remote_output(self.run_command(&cmd)))
-                });
-                for (user, content) in user_results {
-                    if let Some(text) = content? {
-                        if !text.is_empty() {
-                            tasks.extend(CronAdapter::parse_crontab_at(
-                                &text,
-                                &format!("user:{user}"),
-                                false,
-                                now,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        if !any_present {
-            return Err(RemoteSourceError::Unavailable);
-        }
-        Ok(tasks)
-    }
-
-    fn collect_launchd_parallel(
-        &self,
-        remote_offset: FixedOffset,
-    ) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError> {
-        let now = Utc::now().with_timezone(&remote_offset);
-        if optional_remote_output(self.run_command("command -v launchctl >/dev/null 2>&1"))?
-            .is_none()
-        {
-            return Err(RemoteSourceError::Unavailable);
-        }
-        let listing = match self.run_command("launchctl list") {
-            Ok(s) => s,
-            Err(RemoteCmdError::NotFound) => return Err(RemoteSourceError::Unavailable),
-            Err(e) => return Err(remote_source_error("launchctl list", e)),
-        };
-        let runtime: std::collections::HashMap<String, LaunchctlEntry> =
-            LaunchdAdapter::parse_launchctl_list(&listing)
-                .into_iter()
-                .map(|e| (e.label.clone(), e))
-                .collect();
-
-        let find_cmd = "find $HOME/Library/LaunchAgents /Library/LaunchAgents \
-                        /Library/LaunchDaemons /System/Library/LaunchAgents \
-                        /System/Library/LaunchDaemons -maxdepth 1 -name '*.plist' 2>/dev/null";
-        let plist_paths_str =
-            optional_remote_output(self.run_command(find_cmd))?.unwrap_or_default();
-        let plist_paths: Vec<String> = plist_paths_str
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
-
-        // /System/Library/LaunchDaemons alone has 50+ plists; parallel
-        // cat is the biggest win in this whole module.
-        let plist_results: Vec<(
-            String,
-            std::result::Result<Option<String>, RemoteSourceError>,
-        )> = parallel_map(&plist_paths, REMOTE_PARALLELISM, |path| {
-            let cmd = format!("cat {} 2>/dev/null", shell_quote(path));
-            (path.clone(), optional_remote_output(self.run_command(&cmd)))
-        });
-
-        let mut tasks = Vec::new();
-        for (path, content_opt) in plist_results {
-            let Some(content) = content_opt? else {
-                continue;
-            };
-            match LaunchdAdapter::parse_plist_at(content.as_bytes(), now) {
-                Ok(Some(mut task)) => {
-                    let rt_entry = runtime.get(&task.id);
-                    apply_launchctl_runtime(&mut task, rt_entry);
-                    tasks.push(task);
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("warning: parse {path}: {e}"),
-            }
-        }
         Ok(tasks)
     }
 
@@ -463,11 +254,10 @@ fn crontab_list_cmd(user: &str, current: Option<&str>) -> String {
 
 /// Username the SSH session runs as, so the bridge knows which crontab
 /// to read without `-u`. `None` if `id` is unavailable or unsafe.
-fn remote_current_user<F>(run: &mut F) -> std::result::Result<Option<String>, RemoteSourceError>
-where
-    F: FnMut(&str) -> std::result::Result<String, RemoteCmdError>,
-{
-    Ok(optional_remote_output(run("id -un 2>/dev/null"))?
+fn remote_current_user(
+    runner: &impl CommandRunner,
+) -> std::result::Result<Option<String>, RemoteSourceError> {
+    Ok(optional_remote_output(runner.run("id -un 2>/dev/null"))?
         .map(|s| s.trim().to_string())
         .filter(|s| shell_safe_username(s)))
 }
@@ -531,17 +321,15 @@ fn remote_source_error(context: &str, error: RemoteCmdError) -> RemoteSourceErro
     }
 }
 
-// Closure-based per-source collectors. These take a generic `FnMut`
-// runner so tests can inject a fixture-driven router. Production paths
-// use the parallel methods on `RemoteCollector` instead, so these are
-// only live under `cfg(test)`.
+/// `$HOME` is expanded by the remote shell.
+const LAUNCHD_FIND_CMD: &str = "find $HOME/Library/LaunchAgents /Library/LaunchAgents \
+                                /Library/LaunchDaemons /System/Library/LaunchAgents \
+                                /System/Library/LaunchDaemons -maxdepth 1 -name '*.plist' 2>/dev/null";
 
-#[allow(dead_code)]
-fn collect_systemd_via<F>(run: &mut F) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError>
-where
-    F: FnMut(&str) -> std::result::Result<String, RemoteCmdError>,
-{
-    match run("command -v systemctl >/dev/null 2>&1 && echo present") {
+fn collect_systemd(
+    runner: &impl CommandRunner,
+) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError> {
+    match runner.run("command -v systemctl >/dev/null 2>&1 && echo present") {
         Ok(s) if s.trim() == "present" => {}
         Ok(_) => return Err(RemoteSourceError::Unavailable),
         Err(RemoteCmdError::NotFound) | Err(RemoteCmdError::Failed { .. }) => {
@@ -550,7 +338,7 @@ where
         Err(RemoteCmdError::Ssh(e)) => return Err(RemoteSourceError::Transport(e)),
     }
 
-    let json = match run("systemctl list-timers --all --output=json --no-pager") {
+    let json = match runner.run("systemctl list-timers --all --output=json --no-pager") {
         Ok(s) => s,
         Err(RemoteCmdError::NotFound) => return Err(RemoteSourceError::Unavailable),
         Err(e) => return Err(remote_source_error("systemctl list-timers", e)),
@@ -558,47 +346,82 @@ where
     let mut tasks = SystemdAdapter::parse_list_timers(&json)
         .map_err(|e| RemoteSourceError::Other(anyhow!("parse list-timers: {e}")))?;
 
-    // show errors are non-fatal — keep the task with what list-timers gave us.
-    for task in &mut tasks {
-        let timer_text = run(&systemctl_show_cmd(&task.id, TIMER_SHOW_PROPERTIES)).ok();
-        let service = task.command.clone();
-        let service_text = if service.is_empty() {
-            None
-        } else {
-            run(&systemctl_show_cmd(&service, SERVICE_SHOW_PROPERTIES)).ok()
-        };
+    // Two `systemctl show` calls per timer, fanned out — 30 serial
+    // round-trips become ceil(N/8) waves of 8 in parallel.
+    let work: Vec<(String, String)> = tasks
+        .iter()
+        .map(|t| (t.id.clone(), t.command.clone()))
+        .collect();
+
+    let results: Vec<(Option<String>, Option<String>)> =
+        parallel_map(&work, REMOTE_PARALLELISM, |(unit_id, service)| {
+            let timer_text = optional_remote_output(
+                runner.run(&systemctl_show_cmd(unit_id, TIMER_SHOW_PROPERTIES)),
+            );
+            let service_text = if !service.is_empty() {
+                optional_remote_output(
+                    runner.run(&systemctl_show_cmd(service, SERVICE_SHOW_PROPERTIES)),
+                )
+            } else {
+                Ok(None)
+            };
+            (timer_text, service_text)
+        })
+        .into_iter()
+        .map(|(timer, service)| Ok((timer?, service?)))
+        .collect::<std::result::Result<Vec<_>, RemoteSourceError>>()?;
+
+    for (task, (timer_text, service_text)) in tasks.iter_mut().zip(results) {
         SystemdAdapter::apply_show(task, timer_text.as_deref(), service_text.as_deref());
     }
 
     Ok(tasks)
 }
 
-#[allow(dead_code)]
-fn collect_cron_via<F>(run: &mut F) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError>
-where
-    F: FnMut(&str) -> std::result::Result<String, RemoteCmdError>,
-{
+fn collect_cron(
+    runner: &impl CommandRunner,
+    now: DateTime<FixedOffset>,
+) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError> {
     let mut tasks = Vec::new();
     let mut any_present = false;
 
-    if let Ok(text) = run("cat /etc/crontab 2>/dev/null") {
+    if let Some(text) = optional_remote_output(runner.run("cat /etc/crontab 2>/dev/null"))? {
         any_present = true;
         if !text.is_empty() {
-            tasks.extend(CronAdapter::parse_crontab(&text, "/etc/crontab", true));
+            tasks.extend(CronAdapter::parse_crontab_at(
+                &text,
+                "/etc/crontab",
+                true,
+                now,
+            ));
         }
     }
 
-    if let Ok(listing) = run("ls -1 /etc/cron.d 2>/dev/null") {
+    // /etc/cron.d/* — list once, then cat in parallel.
+    if let Some(listing) = optional_remote_output(runner.run("ls -1 /etc/cron.d 2>/dev/null"))? {
         any_present = true;
-        for filename in listing.lines().map(str::trim).filter(|s| !s.is_empty()) {
-            let path = format!("/etc/cron.d/{filename}");
+        let filenames: Vec<String> = listing
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        let cron_d_results: Vec<(
+            String,
+            std::result::Result<Option<String>, RemoteSourceError>,
+        )> = parallel_map(&filenames, REMOTE_PARALLELISM, |fname| {
+            let path = format!("/etc/cron.d/{fname}");
             let cmd = format!("cat {} 2>/dev/null", shell_quote(&path));
-            if let Ok(text) = run(&cmd) {
-                tasks.extend(CronAdapter::parse_crontab(&text, &path, true));
+            (path, optional_remote_output(runner.run(&cmd)))
+        });
+        for (path, content) in cron_d_results {
+            if let Some(text) = content? {
+                tasks.extend(CronAdapter::parse_crontab_at(&text, &path, true, now));
             }
         }
     }
 
+    // run-parts directories. Just 4 ls calls — keep serial.
     for (period, dir) in [
         ("hourly", "/etc/cron.hourly"),
         ("daily", "/etc/cron.daily"),
@@ -606,7 +429,7 @@ where
         ("monthly", "/etc/cron.monthly"),
     ] {
         let cmd = format!("ls -1 {} 2>/dev/null", shell_quote(dir));
-        if let Ok(listing) = run(&cmd) {
+        if let Some(listing) = optional_remote_output(runner.run(&cmd))? {
             any_present = true;
             let scripts: Vec<&str> = listing
                 .lines()
@@ -614,26 +437,35 @@ where
                 .filter(|s| !s.is_empty())
                 .collect();
             if !scripts.is_empty() {
-                tasks.extend(CronAdapter::parse_run_parts(period, &scripts, dir));
+                tasks.extend(CronAdapter::parse_run_parts_at(period, &scripts, dir, now));
             }
         }
     }
 
-    if run("command -v crontab >/dev/null 2>&1").is_ok() {
+    // Per-user crontabs in parallel.
+    if optional_remote_output(runner.run("command -v crontab >/dev/null 2>&1"))?.is_some() {
         any_present = true;
-        if let Ok(passwd) = run("cat /etc/passwd 2>/dev/null") {
-            let current = remote_current_user(run)?;
-            for user in CronAdapter::parse_passwd(&passwd) {
-                if !shell_safe_username(&user) {
-                    continue;
-                }
-                let cmd = crontab_list_cmd(&user, current.as_deref());
-                if let Ok(text) = run(&cmd) {
+        if let Some(passwd) = optional_remote_output(runner.run("cat /etc/passwd 2>/dev/null"))? {
+            let current = remote_current_user(runner)?;
+            let users: Vec<String> = CronAdapter::parse_passwd(&passwd)
+                .into_iter()
+                .filter(|u| shell_safe_username(u))
+                .collect();
+            let user_results: Vec<(
+                String,
+                std::result::Result<Option<String>, RemoteSourceError>,
+            )> = parallel_map(&users, REMOTE_PARALLELISM, |user| {
+                let cmd = crontab_list_cmd(user, current.as_deref());
+                (user.clone(), optional_remote_output(runner.run(&cmd)))
+            });
+            for (user, content) in user_results {
+                if let Some(text) = content? {
                     if !text.is_empty() {
-                        tasks.extend(CronAdapter::parse_crontab(
+                        tasks.extend(CronAdapter::parse_crontab_at(
                             &text,
                             &format!("user:{user}"),
                             false,
+                            now,
                         ));
                     }
                 }
@@ -647,17 +479,68 @@ where
     Ok(tasks)
 }
 
-fn collect_at_via<F, Tz: TimeZone>(
-    run: &mut F,
-    timezone: &Tz,
-) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError>
-where
-    F: FnMut(&str) -> std::result::Result<String, RemoteCmdError>,
-{
-    if optional_remote_output(run("command -v atq >/dev/null 2>&1"))?.is_none() {
+fn collect_launchd(
+    runner: &impl CommandRunner,
+    now: DateTime<FixedOffset>,
+) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError> {
+    if optional_remote_output(runner.run("command -v launchctl >/dev/null 2>&1"))?.is_none() {
         return Err(RemoteSourceError::Unavailable);
     }
-    let listing = match run("atq") {
+    let listing = match runner.run("launchctl list") {
+        Ok(s) => s,
+        Err(RemoteCmdError::NotFound) => return Err(RemoteSourceError::Unavailable),
+        Err(e) => return Err(remote_source_error("launchctl list", e)),
+    };
+    let runtime: std::collections::HashMap<String, LaunchctlEntry> =
+        LaunchdAdapter::parse_launchctl_list(&listing)
+            .into_iter()
+            .map(|e| (e.label.clone(), e))
+            .collect();
+
+    let plist_paths_str = optional_remote_output(runner.run(LAUNCHD_FIND_CMD))?.unwrap_or_default();
+    let plist_paths: Vec<String> = plist_paths_str
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    // /System/Library/LaunchDaemons alone has 50+ plists; parallel
+    // cat is the biggest win in this whole module.
+    let plist_results: Vec<(
+        String,
+        std::result::Result<Option<String>, RemoteSourceError>,
+    )> = parallel_map(&plist_paths, REMOTE_PARALLELISM, |path| {
+        let cmd = format!("cat {} 2>/dev/null", shell_quote(path));
+        (path.clone(), optional_remote_output(runner.run(&cmd)))
+    });
+
+    let mut tasks = Vec::new();
+    for (path, content_opt) in plist_results {
+        let Some(content) = content_opt? else {
+            continue;
+        };
+        match LaunchdAdapter::parse_plist_at(content.as_bytes(), now) {
+            Ok(Some(mut task)) => {
+                let rt_entry = runtime.get(&task.id);
+                apply_launchctl_runtime(&mut task, rt_entry);
+                tasks.push(task);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("warning: parse {path}: {e}"),
+        }
+    }
+    Ok(tasks)
+}
+
+fn collect_at<Tz: TimeZone>(
+    runner: &impl CommandRunner,
+    timezone: &Tz,
+) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError> {
+    if optional_remote_output(runner.run("command -v atq >/dev/null 2>&1"))?.is_none() {
+        return Err(RemoteSourceError::Unavailable);
+    }
+    let listing = match runner.run("atq") {
         Ok(s) => s,
         Err(RemoteCmdError::NotFound) => return Err(RemoteSourceError::Unavailable),
         Err(e) => return Err(remote_source_error("atq", e)),
@@ -673,7 +556,7 @@ where
             continue;
         }
         let cmd = format!("at -c {num} 2>/dev/null");
-        if let Some(text) = optional_remote_output(run(&cmd))? {
+        if let Some(text) = optional_remote_output(runner.run(&cmd))? {
             if let Some(c) = AtAdapter::parse_at_c(&text) {
                 task.command = c;
             }
@@ -682,11 +565,10 @@ where
     Ok(tasks)
 }
 
-fn collect_anacron_via<F>(run: &mut F) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError>
-where
-    F: FnMut(&str) -> std::result::Result<String, RemoteCmdError>,
-{
-    let text = match optional_remote_output(run("cat /etc/anacrontab 2>/dev/null"))? {
+fn collect_anacron(
+    runner: &impl CommandRunner,
+) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError> {
+    let text = match optional_remote_output(runner.run("cat /etc/anacrontab 2>/dev/null"))? {
         Some(text) if !text.is_empty() => text,
         _ => return Err(RemoteSourceError::Unavailable),
     };
@@ -700,7 +582,7 @@ where
             continue;
         }
         let cmd = format!("cat /var/spool/anacron/{job_id} 2>/dev/null");
-        if let Some(spool) = optional_remote_output(run(&cmd))? {
+        if let Some(spool) = optional_remote_output(runner.run(&cmd))? {
             if let Some(date) = AnacronAdapter::parse_spool_file(&spool) {
                 if let Some(last) = Utc
                     .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
@@ -712,62 +594,6 @@ where
                     }
                 }
             }
-        }
-    }
-
-    Ok(tasks)
-}
-
-#[allow(dead_code)]
-fn collect_launchd_via<F>(
-    run: &mut F,
-    now: DateTime<FixedOffset>,
-) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError>
-where
-    F: FnMut(&str) -> std::result::Result<String, RemoteCmdError>,
-{
-    if run("command -v launchctl >/dev/null 2>&1").is_err() {
-        return Err(RemoteSourceError::Unavailable);
-    }
-    let listing = match run("launchctl list") {
-        Ok(s) => s,
-        Err(RemoteCmdError::NotFound) => return Err(RemoteSourceError::Unavailable),
-        Err(e) => return Err(remote_source_error("launchctl list", e)),
-    };
-    let runtime: std::collections::HashMap<String, LaunchctlEntry> =
-        LaunchdAdapter::parse_launchctl_list(&listing)
-            .into_iter()
-            .map(|e| (e.label.clone(), e))
-            .collect();
-
-    // `$HOME` is expanded by the remote shell.
-    let find_cmd = "find $HOME/Library/LaunchAgents /Library/LaunchAgents \
-                    /Library/LaunchDaemons /System/Library/LaunchAgents \
-                    /System/Library/LaunchDaemons -maxdepth 1 -name '*.plist' 2>/dev/null";
-    let plist_paths = run(find_cmd).unwrap_or_default();
-
-    let mut tasks = Vec::new();
-    for path in plist_paths.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        let cmd = format!("cat {} 2>/dev/null", shell_quote(path));
-        let Ok(content) = run(&cmd) else { continue };
-        match LaunchdAdapter::parse_plist_at(content.as_bytes(), now) {
-            Ok(Some(mut task)) => {
-                if let Some(rt) = runtime.get(&task.id) {
-                    task.last_status = rt.last_exit_status.map(|code| {
-                        if code == 0 {
-                            TaskStatus::Success
-                        } else {
-                            TaskStatus::Failed(format!("exit {code}"))
-                        }
-                    });
-                    if rt.pid.is_some() && task.last_status.is_none() {
-                        task.last_status = Some(TaskStatus::Running);
-                    }
-                }
-                tasks.push(task);
-            }
-            Ok(None) => {}
-            Err(e) => eprintln!("warning: parse {path}: {e}"),
         }
     }
 
@@ -857,6 +683,65 @@ mod tests {
             key_path: None,
             control_path: PathBuf::from("/tmp/shuvjobs-ssh-1"),
         }
+    }
+
+    /// What the fixture runner returns for a command it has no fixture
+    /// for. `Failed` is the realistic default (the source slice simply
+    /// isn't present); the other two drive the "everything fails" cases.
+    #[derive(Clone, Copy)]
+    enum Fallback {
+        Failed,
+        NotFound,
+        SshDown,
+    }
+
+    /// [`CommandRunner`] backed by a fixed command → stdout map, so the
+    /// real production collectors run unchanged and the fixture keys
+    /// assert the exact command strings issued over SSH.
+    struct FixtureRunner {
+        fixtures: HashMap<&'static str, &'static str>,
+        fallback: Fallback,
+    }
+
+    impl FixtureRunner {
+        fn new(fixtures: HashMap<&'static str, &'static str>) -> Self {
+            Self {
+                fixtures,
+                fallback: Fallback::Failed,
+            }
+        }
+
+        fn always(fallback: Fallback) -> Self {
+            Self {
+                fixtures: HashMap::new(),
+                fallback,
+            }
+        }
+    }
+
+    impl CommandRunner for FixtureRunner {
+        fn run(&self, cmd: &str) -> std::result::Result<String, RemoteCmdError> {
+            match self.fixtures.get(cmd) {
+                Some(s) => Ok((*s).to_string()),
+                None => Err(match self.fallback {
+                    Fallback::Failed => RemoteCmdError::Failed {
+                        exit_code: 1,
+                        stderr: String::new(),
+                    },
+                    Fallback::NotFound => RemoteCmdError::NotFound,
+                    Fallback::SshDown => RemoteCmdError::Ssh(anyhow!("connection lost")),
+                }),
+            }
+        }
+    }
+
+    /// Fixed "now" in a non-UTC offset, standing in for the remote host's
+    /// wall clock in the tests that need a deterministic schedule.
+    fn remote_now() -> DateTime<FixedOffset> {
+        FixedOffset::west_opt(7 * 60 * 60)
+            .unwrap()
+            .with_ymd_and_hms(2026, 4, 14, 1, 30, 0)
+            .unwrap()
     }
 
     #[test]
@@ -950,34 +835,10 @@ mod tests {
     }
 
     #[test]
-    fn at_via_propagates_ssh_transport_errors() {
-        let mut run = |_cmd: &str| Err(RemoteCmdError::Ssh(anyhow!("connection lost")));
-        let result = collect_at_via(&mut run, &Utc);
+    fn at_propagates_ssh_transport_errors() {
+        let runner = FixtureRunner::always(Fallback::SshDown);
+        let result = collect_at(&runner, &Utc);
         assert!(matches!(result, Err(RemoteSourceError::Transport(_))));
-    }
-
-    /// Build a runner that looks up commands in a fixed map. Unknown
-    /// commands fall through to `Failed{1}`, which the collectors treat
-    /// as "this slice of the source isn't present".
-    /// Fixed "now" in a non-UTC offset, standing in for the remote host's
-    /// wall clock in the tests that exercise the launchd bridge.
-    fn remote_now() -> DateTime<FixedOffset> {
-        FixedOffset::west_opt(7 * 60 * 60)
-            .unwrap()
-            .with_ymd_and_hms(2026, 4, 14, 1, 30, 0)
-            .unwrap()
-    }
-
-    fn router(
-        fixtures: HashMap<&'static str, &'static str>,
-    ) -> impl FnMut(&str) -> std::result::Result<String, RemoteCmdError> {
-        move |cmd: &str| match fixtures.get(cmd) {
-            Some(s) => Ok((*s).to_string()),
-            None => Err(RemoteCmdError::Failed {
-                exit_code: 1,
-                stderr: String::new(),
-            }),
-        }
     }
 
     const SYSTEMD_LIST: &str = r#"[
@@ -996,7 +857,7 @@ ExecMainExitTimestampMonotonic=40202376368
 ";
 
     #[test]
-    fn systemd_via_runs_full_pipeline() {
+    fn systemd_runs_full_pipeline() {
         let mut fx = HashMap::new();
         fx.insert(
             "command -v systemctl >/dev/null 2>&1 && echo present",
@@ -1014,9 +875,8 @@ ExecMainExitTimestampMonotonic=40202376368
             "systemctl show 'logrotate.service' --property=ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
             SYSTEMD_SHOW_SERVICE,
         );
-        let mut run = router(fx);
 
-        let tasks = collect_systemd_via(&mut run).unwrap();
+        let tasks = collect_systemd(&FixtureRunner::new(fx)).unwrap();
         assert_eq!(tasks.len(), 1);
         let t = &tasks[0];
         assert_eq!(t.id, "logrotate.timer");
@@ -1030,7 +890,13 @@ ExecMainExitTimestampMonotonic=40202376368
     }
 
     #[test]
-    fn cron_via_reads_own_crontab_without_dash_u() {
+    fn systemd_unavailable_when_systemctl_missing() {
+        let err = collect_systemd(&FixtureRunner::always(Fallback::NotFound)).unwrap_err();
+        assert!(matches!(err, RemoteSourceError::Unavailable));
+    }
+
+    #[test]
+    fn cron_reads_own_crontab_without_dash_u() {
         let mut fx = HashMap::new();
         fx.insert("command -v crontab >/dev/null 2>&1", "");
         fx.insert("id -un 2>/dev/null", "alice\n");
@@ -1042,9 +908,8 @@ ExecMainExitTimestampMonotonic=40202376368
             "crontab -l 2>/dev/null",
             "0 9 * * 1-5 /home/alice/bin/standup\n",
         );
-        // root's crontab is unreadable as alice: router returns Failed{1}.
-        let mut run = router(fx);
-        let tasks = collect_cron_via(&mut run).unwrap();
+        // root's crontab is unreadable as alice: the runner returns Failed{1}.
+        let tasks = collect_cron(&FixtureRunner::new(fx), remote_now()).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "user:alice:1");
         assert_eq!(tasks[0].command, "/home/alice/bin/standup");
@@ -1064,22 +929,16 @@ ExecMainExitTimestampMonotonic=40202376368
 
     #[test]
     fn remote_current_user_rejects_unsafe_names() {
-        let mut run = |_: &str| Ok("evil; rm -rf /\n".to_string());
-        assert_eq!(remote_current_user(&mut run).unwrap(), None);
-        let mut run = |_: &str| Ok("alice\n".to_string());
+        let mut fx = HashMap::new();
+        fx.insert("id -un 2>/dev/null", "evil; rm -rf /\n");
+        assert_eq!(remote_current_user(&FixtureRunner::new(fx)).unwrap(), None);
+
+        let mut fx = HashMap::new();
+        fx.insert("id -un 2>/dev/null", "alice\n");
         assert_eq!(
-            remote_current_user(&mut run).unwrap(),
+            remote_current_user(&FixtureRunner::new(fx)).unwrap(),
             Some("alice".to_string())
         );
-    }
-
-    #[test]
-    fn systemd_via_unavailable_when_systemctl_missing() {
-        let mut run = |_cmd: &str| -> std::result::Result<String, RemoteCmdError> {
-            Err(RemoteCmdError::NotFound)
-        };
-        let err = collect_systemd_via(&mut run).unwrap_err();
-        assert!(matches!(err, RemoteSourceError::Unavailable));
     }
 
     const ETC_CRONTAB: &str = "\
@@ -1089,25 +948,36 @@ ExecMainExitTimestampMonotonic=40202376368
 ";
 
     #[test]
-    fn cron_via_parses_etc_crontab_through_router() {
+    fn cron_parses_etc_crontab_through_the_runner() {
         let mut fx = HashMap::new();
         fx.insert("cat /etc/crontab 2>/dev/null", ETC_CRONTAB);
-        let mut run = router(fx);
-        let tasks = collect_cron_via(&mut run).unwrap();
+        let tasks = collect_cron(&FixtureRunner::new(fx), remote_now()).unwrap();
         assert_eq!(tasks.len(), 2);
         assert!(matches!(tasks[0].schedule, ScheduleType::Cron(ref s) if s == "17 * * * *"));
         assert!(matches!(tasks[1].schedule, ScheduleType::Cron(ref s) if s == "@reboot"));
     }
 
     #[test]
-    fn cron_via_unavailable_when_nothing_found() {
-        let mut run = |_cmd: &str| -> std::result::Result<String, RemoteCmdError> {
-            Err(RemoteCmdError::Failed {
-                exit_code: 1,
-                stderr: String::new(),
-            })
-        };
-        let err = collect_cron_via(&mut run).unwrap_err();
+    fn cron_next_run_uses_the_remote_offset() {
+        // 01:30 on the remote's +03:00 clock; the next 02:00 there is
+        // 23:00 UTC on the previous day.
+        let now = FixedOffset::east_opt(3 * 60 * 60)
+            .unwrap()
+            .with_ymd_and_hms(2026, 4, 14, 1, 30, 0)
+            .unwrap();
+        let mut fx = HashMap::new();
+        fx.insert("cat /etc/crontab 2>/dev/null", "0 2 * * * root /bin/true\n");
+        let tasks = collect_cron(&FixtureRunner::new(fx), now).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].next_run,
+            Some(Utc.with_ymd_and_hms(2026, 4, 13, 23, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn cron_unavailable_when_nothing_found() {
+        let err = collect_cron(&FixtureRunner::always(Fallback::Failed), remote_now()).unwrap_err();
         assert!(matches!(err, RemoteSourceError::Unavailable));
     }
 
@@ -1121,24 +991,20 @@ ExecMainExitTimestampMonotonic=40202376368
                                 marcinABC\n";
 
     #[test]
-    fn at_via_parses_atq_and_at_c() {
+    fn at_parses_atq_and_at_c() {
         let mut fx = HashMap::new();
         fx.insert("command -v atq >/dev/null 2>&1", "");
         fx.insert("atq", ATQ_OUTPUT);
         fx.insert("at -c 12 2>/dev/null", AT_C_OUTPUT);
-        let mut run = router(fx);
-        let tasks = collect_at_via(&mut run, &Utc).unwrap();
+        let tasks = collect_at(&FixtureRunner::new(fx), &Utc).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "at:12");
         assert_eq!(tasks[0].command, "echo hello");
     }
 
     #[test]
-    fn at_via_unavailable_when_atq_missing() {
-        let mut run = |_cmd: &str| -> std::result::Result<String, RemoteCmdError> {
-            Err(RemoteCmdError::NotFound)
-        };
-        let err = collect_at_via(&mut run, &Utc).unwrap_err();
+    fn at_unavailable_when_atq_missing() {
+        let err = collect_at(&FixtureRunner::always(Fallback::NotFound), &Utc).unwrap_err();
         assert!(matches!(err, RemoteSourceError::Unavailable));
     }
 
@@ -1150,15 +1016,14 @@ ExecMainExitTimestampMonotonic=40202376368
 ";
 
     #[test]
-    fn anacron_via_parses_anacrontab_and_spool() {
+    fn anacron_parses_anacrontab_and_spool() {
         let mut fx = HashMap::new();
         fx.insert("cat /etc/anacrontab 2>/dev/null", ANACRONTAB);
         fx.insert(
             "cat /var/spool/anacron/cron.daily 2>/dev/null",
             "20260410\n",
         );
-        let mut run = router(fx);
-        let tasks = collect_anacron_via(&mut run).unwrap();
+        let tasks = collect_anacron(&FixtureRunner::new(fx)).unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].name, "cron.daily");
         assert!(tasks[0].last_run.is_some());
@@ -1168,14 +1033,8 @@ ExecMainExitTimestampMonotonic=40202376368
     }
 
     #[test]
-    fn anacron_via_unavailable_when_anacrontab_missing() {
-        let mut run = |_cmd: &str| -> std::result::Result<String, RemoteCmdError> {
-            Err(RemoteCmdError::Failed {
-                exit_code: 1,
-                stderr: String::new(),
-            })
-        };
-        let err = collect_anacron_via(&mut run).unwrap_err();
+    fn anacron_unavailable_when_anacrontab_missing() {
+        let err = collect_anacron(&FixtureRunner::always(Fallback::Failed)).unwrap_err();
         assert!(matches!(err, RemoteSourceError::Unavailable));
     }
 
@@ -1193,23 +1052,19 @@ ExecMainExitTimestampMonotonic=40202376368
 </plist>"#;
 
     #[test]
-    fn launchd_via_parses_listing_and_plists() {
+    fn launchd_parses_listing_and_plists() {
         let mut fx = HashMap::new();
         fx.insert("command -v launchctl >/dev/null 2>&1", "");
         fx.insert("launchctl list", LAUNCHCTL_LIST);
-        let find_cmd = "find $HOME/Library/LaunchAgents /Library/LaunchAgents \
-                        /Library/LaunchDaemons /System/Library/LaunchAgents \
-                        /System/Library/LaunchDaemons -maxdepth 1 -name '*.plist' 2>/dev/null";
         fx.insert(
-            find_cmd,
+            LAUNCHD_FIND_CMD,
             "/Library/LaunchAgents/com.example.heartbeat.plist\n",
         );
         fx.insert(
             "cat '/Library/LaunchAgents/com.example.heartbeat.plist' 2>/dev/null",
             PLIST_BODY,
         );
-        let mut run = router(fx);
-        let tasks = collect_launchd_via(&mut run, remote_now()).unwrap();
+        let tasks = collect_launchd(&FixtureRunner::new(fx), remote_now()).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "com.example.heartbeat");
         // launchctl reported exit 0 → Success
@@ -1221,11 +1076,9 @@ ExecMainExitTimestampMonotonic=40202376368
     }
 
     #[test]
-    fn launchd_via_unavailable_when_launchctl_missing() {
-        let mut run = |_cmd: &str| -> std::result::Result<String, RemoteCmdError> {
-            Err(RemoteCmdError::NotFound)
-        };
-        let err = collect_launchd_via(&mut run, remote_now()).unwrap_err();
+    fn launchd_unavailable_when_launchctl_missing() {
+        let err =
+            collect_launchd(&FixtureRunner::always(Fallback::NotFound), remote_now()).unwrap_err();
         assert!(matches!(err, RemoteSourceError::Unavailable));
     }
 
