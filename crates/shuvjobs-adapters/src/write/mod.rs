@@ -8,6 +8,7 @@
 pub mod anacron;
 pub mod calendar;
 pub mod cron;
+pub mod systemd;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +30,10 @@ pub fn writers_for(host: Arc<dyn Host>) -> HashMap<TaskSourceKind, Box<dyn JobWr
     writers.insert(
         TaskSourceKind::Anacron,
         Box::new(anacron::AnacronWriter::new(Arc::clone(&host))),
+    );
+    writers.insert(
+        TaskSourceKind::Systemd,
+        Box::new(systemd::SystemdWriter::new(Arc::clone(&host))),
     );
     writers
 }
