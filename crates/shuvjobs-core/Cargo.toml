@@ -12,3 +12,7 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+# Exposes `host::FakeHost` to the other crates' test targets.
+test-support = []

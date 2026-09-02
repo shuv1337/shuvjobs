@@ -2,6 +2,7 @@
 
 mod error;
 pub mod export;
+pub mod host;
 mod models;
 mod source;
 pub mod view;

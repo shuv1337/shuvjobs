@@ -25,6 +25,7 @@ use shuvjobs_adapters::{
     },
     AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter,
 };
+use shuvjobs_core::host::shell::{shell_quote, shell_safe_filename, shell_safe_username};
 use shuvjobs_core::{ScheduledTask, TaskStatus};
 
 /// Cap below sshd's default `MaxSessions` (10) so we never get refused
@@ -677,25 +678,6 @@ fn collect_anacron(
     }
 
     Ok(tasks)
-}
-
-/// POSIX-safe single-quoting: wraps `s` in `'...'` and escapes any
-/// embedded `'` by closing the literal, inserting `\'`, and reopening.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
-/// Whitelist for usernames before interpolating them into a shell command.
-fn shell_safe_username(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-}
-
-fn shell_safe_filename(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 /// Map `f` over `items` with up to `max_parallel` workers in flight,
