@@ -18,6 +18,56 @@ use shuvjobs_core::{
     Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind, TaskStatus,
 };
 
+/// Which systemd manager a timer belongs to. `systemctl` talks to the
+/// system manager by default and to the calling user's manager with
+/// `--user`; the two namespaces can hold identically named units, so the
+/// scope is part of a task's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    System,
+    User,
+}
+
+/// Prefix that marks a user-scope task id. System-scope ids stay bare so
+/// the common case reads as the plain unit name.
+const USER_ID_PREFIX: &str = "user/";
+
+impl Scope {
+    /// Extra argv passed to every `systemctl` invocation for this scope.
+    pub fn systemctl_args(self) -> &'static [&'static str] {
+        match self {
+            Self::System => &[],
+            Self::User => &["--user"],
+        }
+    }
+
+    /// Stable task id for `unit` in this scope.
+    pub fn task_id(self, unit: &str) -> String {
+        match self {
+            Self::System => unit.to_string(),
+            Self::User => format!("{USER_ID_PREFIX}{unit}"),
+        }
+    }
+
+    /// Display name for `unit` in this scope.
+    pub fn task_name(self, unit: &str) -> String {
+        let trimmed = trim_unit_suffix(unit);
+        match self {
+            Self::System => trimmed.to_string(),
+            Self::User => format!("{trimmed} (user)"),
+        }
+    }
+}
+
+/// Inverse of [`Scope::task_id`]: map a task id back to the scope and the
+/// unit name to pass to `systemctl show`.
+pub fn split_task_id(id: &str) -> (Scope, &str) {
+    match id.strip_prefix(USER_ID_PREFIX) {
+        Some(unit) => (Scope::User, unit),
+        None => (Scope::System, id),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SystemdAdapter;
 
@@ -26,7 +76,15 @@ impl SystemdAdapter {
         Self
     }
 
+    /// Parse `systemctl list-timers --output=json` from the system manager.
     pub fn parse_list_timers(json: &str) -> Result<Vec<ScheduledTask>> {
+        Self::parse_list_timers_scoped(json, Scope::System)
+    }
+
+    /// Parse `systemctl [--user] list-timers --output=json`. `scope`
+    /// decides the id and display name so system and user units with the
+    /// same name stay distinguishable.
+    pub fn parse_list_timers_scoped(json: &str, scope: Scope) -> Result<Vec<ScheduledTask>> {
         // `next`/`last` come back as either microsecond integers or
         // `null` (Ubuntu's `apport-autoreport.timer` is the canonical
         // null case). `left`/`passed` are unused but still optional.
@@ -55,8 +113,8 @@ impl SystemdAdapter {
         let tasks = rows
             .into_iter()
             .map(|r| ScheduledTask {
-                id: r.unit.clone(),
-                name: trim_unit_suffix(&r.unit).to_string(),
+                id: scope.task_id(&r.unit),
+                name: scope.task_name(&r.unit),
                 source: TaskSourceKind::Systemd,
                 // Filled in later by parse_show_timer.
                 schedule: ScheduleType::Calendar(String::new()),
@@ -229,21 +287,46 @@ impl TaskSource for SystemdAdapter {
         }
 
         let stdout = String::from_utf8_lossy(&listing.stdout);
-        let mut tasks = Self::parse_list_timers(&stdout)?;
+        let mut tasks = Self::parse_list_timers_scoped(&stdout, Scope::System)?;
+
+        // The user manager is optional: no session bus, no lingering, or
+        // running as root without XDG_RUNTIME_DIR all make `systemctl
+        // --user` exit non-zero. That is "nothing to report", never an
+        // adapter error.
+        if let Some(json) = run_list_timers(Scope::User) {
+            if let Ok(user_tasks) = Self::parse_list_timers_scoped(&json, Scope::User) {
+                tasks.extend(user_tasks);
+            }
+        }
 
         for task in &mut tasks {
-            let timer_text = run_show(&task.id, TIMER_SHOW_PROPERTIES);
+            let (scope, unit) = split_task_id(&task.id);
+            let timer_text = run_show(scope, unit, TIMER_SHOW_PROPERTIES);
             let service = task.command.clone();
             let service_text = if service.is_empty() {
                 None
             } else {
-                run_show(&service, SERVICE_SHOW_PROPERTIES)
+                run_show(scope, &service, SERVICE_SHOW_PROPERTIES)
             };
             Self::apply_show(task, timer_text.as_deref(), service_text.as_deref());
         }
 
         Ok(tasks)
     }
+}
+
+/// `systemctl [--user] list-timers` stdout, or `None` when that manager
+/// is not reachable.
+fn run_list_timers(scope: Scope) -> Option<String> {
+    let out = Command::new("systemctl")
+        .args(scope.systemctl_args())
+        .args(["list-timers", "--all", "--output=json", "--no-pager"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -285,9 +368,10 @@ impl ShowService {
     }
 }
 
-fn run_show(unit: &str, properties: &str) -> Option<String> {
+fn run_show(scope: Scope, unit: &str, properties: &str) -> Option<String> {
     let prop_arg = format!("--property={properties}");
     let out = Command::new("systemctl")
+        .args(scope.systemctl_args())
         .args(["show", unit, &prop_arg, "--no-pager"])
         .output()
         .ok()?;
@@ -648,6 +732,65 @@ ExecMainExitTimestampMonotonic=40202376368
             Some(Duration::from_secs(5400))
         );
         assert_eq!(parse_systemd_duration("garbage"), None);
+    }
+
+    // Captured verbatim from `systemctl --user list-timers --all
+    // --output=json --no-pager` on an Arch host with a user manager.
+    const USER_LIST_TIMERS_FIXTURE: &str = r#"[
+        {"next":1788338408746484,"left":1788338408746484,"last":1788336608745417,"passed":43508749618,"unit":"bun-compile-tmp-cleanup.timer","activates":"bun-compile-tmp-cleanup.service"},
+        {"next":1788394500000000,"left":1788394500000000,"last":1788308100017251,"passed":15000021453,"unit":"radar-daily.timer","activates":"radar-daily.service"},
+        {"next":1788741000000000,"left":1788741000000000,"last":1788136200512834,"passed":0,"unit":"radar-weekly.timer","activates":"radar-weekly.service"}
+    ]"#;
+
+    #[test]
+    fn parse_list_timers_scoped_user_prefixes_ids_and_labels_names() {
+        let tasks = SystemdAdapter::parse_list_timers_scoped(USER_LIST_TIMERS_FIXTURE, Scope::User)
+            .unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].id, "user/bun-compile-tmp-cleanup.timer");
+        assert_eq!(tasks[0].name, "bun-compile-tmp-cleanup (user)");
+        assert_eq!(tasks[0].command, "bun-compile-tmp-cleanup.service");
+        assert!(tasks[0].last_run.is_some());
+        assert!(tasks[1].next_run.is_some());
+        assert_eq!(tasks[2].id, "user/radar-weekly.timer");
+    }
+
+    /// The same unit name in both managers must not collide.
+    #[test]
+    fn scoped_ids_are_unique_across_scopes() {
+        let json = r#"[{"next":0,"left":0,"last":0,"passed":0,"unit":"backup.timer","activates":"backup.service"}]"#;
+        let system = SystemdAdapter::parse_list_timers_scoped(json, Scope::System).unwrap();
+        let user = SystemdAdapter::parse_list_timers_scoped(json, Scope::User).unwrap();
+        assert_eq!(system[0].id, "backup.timer");
+        assert_eq!(user[0].id, "user/backup.timer");
+        assert_ne!(system[0].id, user[0].id);
+        assert_ne!(system[0].name, user[0].name);
+    }
+
+    #[test]
+    fn parse_list_timers_defaults_to_system_scope() {
+        let tasks = SystemdAdapter::parse_list_timers(LIST_TIMERS_FIXTURE).unwrap();
+        let scoped =
+            SystemdAdapter::parse_list_timers_scoped(LIST_TIMERS_FIXTURE, Scope::System).unwrap();
+        assert_eq!(tasks, scoped);
+    }
+
+    #[test]
+    fn split_task_id_round_trips_both_scopes() {
+        assert_eq!(
+            split_task_id(&Scope::System.task_id("logrotate.timer")),
+            (Scope::System, "logrotate.timer")
+        );
+        assert_eq!(
+            split_task_id(&Scope::User.task_id("radar-daily.timer")),
+            (Scope::User, "radar-daily.timer")
+        );
+    }
+
+    #[test]
+    fn scope_supplies_the_user_flag() {
+        assert!(Scope::System.systemctl_args().is_empty());
+        assert_eq!(Scope::User.systemctl_args(), ["--user"]);
     }
 
     #[test]

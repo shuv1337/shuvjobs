@@ -36,4 +36,8 @@
   `StartCalendarInterval`, including arrays of intervals (earliest wins) and
   both Sunday spellings of `Weekday`. `StartInterval` jobs still show no next
   run, because launchd does not expose the load time the interval counts from.
+- Collect user-scope systemd timers (`systemctl --user`) alongside system
+  timers, locally and over SSH; user tasks get `user/`-prefixed ids and a
+  `(user)` name suffix, and an unreachable user manager is skipped
+  silently instead of failing the systemd source.
 - Verify the declared minimum Rust version in CI.

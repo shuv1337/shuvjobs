@@ -21,7 +21,8 @@ anacron, and launchd.
 ## Why
 
 A typical Linux server has scheduled work in three different places at
-once: systemd timers under `systemctl list-timers`, system crontabs
+once: systemd timers under `systemctl list-timers` (in both the system
+and per-user managers), system crontabs
 under `/etc/cron.{d,hourly,daily,weekly,monthly}`, and per-user
 crontabs under `crontab -l`. macOS adds launchd to the mix. Each
 subsystem has its own command, output format, and convention for "next
@@ -34,6 +35,8 @@ hand, and reconciling the differences.
 ## Features
 
 - One unified table for cron, systemd timers, `at`, anacron, and launchd
+- Both systemd scopes: system timers and the calling user's own
+  `systemctl --user` timers, shown as `name (user)`
 - Live filter by source kind
 - Sort by next run, last run, name, or status
 - Detail pane with the full command, schedule expression, last status, and run duration
@@ -165,6 +168,13 @@ TUI does not exit.
 "Unavailable" means the adapter is silently skipped on that platform.
 "Optional" means the subsystem may not be installed; if it is not,
 that source is silently skipped too.
+
+User-scope systemd timers are collected in addition to system timers,
+locally and over SSH. Their ids are prefixed with `user/` and their
+names are suffixed with `(user)`. When no user manager is reachable —
+no session bus, no `loginctl enable-linger` on a remote host, or root
+without `XDG_RUNTIME_DIR` — that scope is silently skipped and system
+timers are still reported.
 
 ## Contributing
 

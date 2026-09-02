@@ -18,7 +18,7 @@ use shuvjobs_adapters::{
     anacron::period_advance as anacron_period_advance,
     cron::crontab_list_args,
     launchd::LaunchctlEntry,
-    systemd::{SERVICE_SHOW_PROPERTIES, TIMER_SHOW_PROPERTIES},
+    systemd::{split_task_id, Scope, SERVICE_SHOW_PROPERTIES, TIMER_SHOW_PROPERTIES},
     AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter,
 };
 use shuvjobs_core::{ScheduledTask, TaskStatus};
@@ -236,11 +236,27 @@ impl Drop for RemoteCollector {
     }
 }
 
-fn systemctl_show_cmd(unit: &str, properties: &str) -> String {
+fn systemctl_show_cmd(scope: Scope, unit: &str, properties: &str) -> String {
     format!(
-        "systemctl show {} --property={properties} --no-pager",
+        "systemctl{} show {} --property={properties} --no-pager",
+        scope_flag(scope),
         shell_quote(unit)
     )
+}
+
+fn systemctl_list_timers_cmd(scope: Scope) -> String {
+    format!(
+        "systemctl{} list-timers --all --output=json --no-pager",
+        scope_flag(scope)
+    )
+}
+
+/// `" --user"` or `""`, spliced into the remote shell command.
+fn scope_flag(scope: Scope) -> &'static str {
+    match scope {
+        Scope::System => "",
+        Scope::User => " --user",
+    }
 }
 
 /// `crontab -l` for the SSH login user, `crontab -l -u <user>` (root-only)
@@ -338,13 +354,24 @@ fn collect_systemd(
         Err(RemoteCmdError::Ssh(e)) => return Err(RemoteSourceError::Transport(e)),
     }
 
-    let json = match runner.run("systemctl list-timers --all --output=json --no-pager") {
+    let json = match runner.run(&systemctl_list_timers_cmd(Scope::System)) {
         Ok(s) => s,
         Err(RemoteCmdError::NotFound) => return Err(RemoteSourceError::Unavailable),
         Err(e) => return Err(remote_source_error("systemctl list-timers", e)),
     };
     let mut tasks = SystemdAdapter::parse_list_timers(&json)
         .map_err(|e| RemoteSourceError::Other(anyhow!("parse list-timers: {e}")))?;
+
+    // Over SSH the user manager is usually absent unless lingering is
+    // enabled — `systemctl --user` then exits non-zero with "Failed to
+    // connect to bus". Treat that as an empty scope, not an error.
+    if let Some(user_json) =
+        optional_remote_output(runner.run(&systemctl_list_timers_cmd(Scope::User)))?
+    {
+        if let Ok(user_tasks) = SystemdAdapter::parse_list_timers_scoped(&user_json, Scope::User) {
+            tasks.extend(user_tasks);
+        }
+    }
 
     // Two `systemctl show` calls per timer, fanned out — 30 serial
     // round-trips become ceil(N/8) waves of 8 in parallel.
@@ -355,13 +382,18 @@ fn collect_systemd(
 
     let results: Vec<(Option<String>, Option<String>)> =
         parallel_map(&work, REMOTE_PARALLELISM, |(unit_id, service)| {
-            let timer_text = optional_remote_output(
-                runner.run(&systemctl_show_cmd(unit_id, TIMER_SHOW_PROPERTIES)),
-            );
+            let (scope, unit) = split_task_id(unit_id);
+            let timer_text = optional_remote_output(runner.run(&systemctl_show_cmd(
+                scope,
+                unit,
+                TIMER_SHOW_PROPERTIES,
+            )));
             let service_text = if !service.is_empty() {
-                optional_remote_output(
-                    runner.run(&systemctl_show_cmd(service, SERVICE_SHOW_PROPERTIES)),
-                )
+                optional_remote_output(runner.run(&systemctl_show_cmd(
+                    scope,
+                    service,
+                    SERVICE_SHOW_PROPERTIES,
+                )))
             } else {
                 Ok(None)
             };
@@ -876,6 +908,8 @@ ExecMainExitTimestampMonotonic=40202376368
             SYSTEMD_SHOW_SERVICE,
         );
 
+        // No `systemctl --user` fixture: the runner's Failed fallback
+        // stands in for "Failed to connect to bus" on a non-lingering host.
         let tasks = collect_systemd(&FixtureRunner::new(fx)).unwrap();
         assert_eq!(tasks.len(), 1);
         let t = &tasks[0];
@@ -886,6 +920,117 @@ ExecMainExitTimestampMonotonic=40202376368
         assert_eq!(
             t.last_duration,
             Some(std::time::Duration::from_micros(24_615))
+        );
+    }
+
+    // Captured from `systemctl --user list-timers --all --output=json
+    // --no-pager` on a host with a running user manager.
+    const SYSTEMD_USER_LIST: &str = r#"[
+        {"next":1788394500000000,"left":1788394500000000,"last":1788308100017251,"passed":15000021453,"unit":"radar-daily.timer","activates":"radar-daily.service"}
+    ]"#;
+    const SYSTEMD_USER_SHOW_TIMER: &str =
+        "TimersCalendar={ OnCalendar=*-*-* 09:15:00 ; next_elapse=Thu 2026-09-03 09:15:00 PDT }\n\
+         Result=success\n";
+    const SYSTEMD_USER_SHOW_SERVICE: &str = "\
+ExecStart={ path=/home/alice/.local/bin/radar ; argv[]=/home/alice/.local/bin/radar daily ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Result=success
+ActiveState=inactive
+SubState=dead
+ExecMainStartTimestampMonotonic=40202351753
+ExecMainExitTimestampMonotonic=40202376368
+";
+
+    /// A remote host with lingering enabled: both managers answer, and the
+    /// user timer lands with a prefixed id alongside the system one.
+    #[test]
+    fn systemd_collects_user_scope_when_the_user_bus_answers() {
+        let mut fx = HashMap::new();
+        fx.insert(
+            "command -v systemctl >/dev/null 2>&1 && echo present",
+            "present\n",
+        );
+        fx.insert(
+            "systemctl list-timers --all --output=json --no-pager",
+            SYSTEMD_LIST,
+        );
+        fx.insert(
+            "systemctl --user list-timers --all --output=json --no-pager",
+            SYSTEMD_USER_LIST,
+        );
+        fx.insert(
+            "systemctl show 'logrotate.timer' --property=TimersCalendar,TimersMonotonic,Result --no-pager",
+            SYSTEMD_SHOW_TIMER,
+        );
+        fx.insert(
+            "systemctl show 'logrotate.service' --property=ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
+            SYSTEMD_SHOW_SERVICE,
+        );
+        fx.insert(
+            "systemctl --user show 'radar-daily.timer' --property=TimersCalendar,TimersMonotonic,Result --no-pager",
+            SYSTEMD_USER_SHOW_TIMER,
+        );
+        fx.insert(
+            "systemctl --user show 'radar-daily.service' --property=ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
+            SYSTEMD_USER_SHOW_SERVICE,
+        );
+
+        let tasks = collect_systemd(&FixtureRunner::new(fx)).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "logrotate.timer");
+        assert_eq!(tasks[0].name, "logrotate");
+
+        let user = &tasks[1];
+        assert_eq!(user.id, "user/radar-daily.timer");
+        assert_eq!(user.name, "radar-daily (user)");
+        assert_eq!(user.command, "/home/alice/.local/bin/radar daily");
+        assert!(matches!(user.schedule, ScheduleType::Calendar(ref s) if s == "*-*-* 09:15:00"));
+        assert!(matches!(user.last_status, Some(TaskStatus::Success)));
+    }
+
+    /// No user bus (the common non-lingering SSH case): `systemctl --user`
+    /// exits non-zero and we report the system scope alone.
+    #[test]
+    fn systemd_skips_user_scope_when_the_user_bus_is_absent() {
+        let mut fx = HashMap::new();
+        fx.insert(
+            "command -v systemctl >/dev/null 2>&1 && echo present",
+            "present\n",
+        );
+        fx.insert(
+            "systemctl list-timers --all --output=json --no-pager",
+            SYSTEMD_LIST,
+        );
+        fx.insert(
+            "systemctl show 'logrotate.timer' --property=TimersCalendar,TimersMonotonic,Result --no-pager",
+            SYSTEMD_SHOW_TIMER,
+        );
+        fx.insert(
+            "systemctl show 'logrotate.service' --property=ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
+            SYSTEMD_SHOW_SERVICE,
+        );
+
+        let tasks = collect_systemd(&FixtureRunner::new(fx)).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "logrotate.timer");
+    }
+
+    #[test]
+    fn systemctl_cmds_carry_the_user_flag_for_user_scope() {
+        assert_eq!(
+            systemctl_list_timers_cmd(Scope::User),
+            "systemctl --user list-timers --all --output=json --no-pager"
+        );
+        assert_eq!(
+            systemctl_list_timers_cmd(Scope::System),
+            "systemctl list-timers --all --output=json --no-pager"
+        );
+        assert_eq!(
+            systemctl_show_cmd(Scope::User, "radar-daily.timer", "Result"),
+            "systemctl --user show 'radar-daily.timer' --property=Result --no-pager"
+        );
+        assert_eq!(
+            systemctl_show_cmd(Scope::System, "logrotate.timer", "Result"),
+            "systemctl show 'logrotate.timer' --property=Result --no-pager"
         );
     }
 
