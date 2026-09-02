@@ -28,3 +28,4 @@ ratatui = "0.30"
 crossterm = "0.29"
 plist = "1.10"
 clap = { version = "4", features = ["derive"] }
+similar = "2"

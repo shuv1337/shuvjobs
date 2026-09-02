@@ -1,119 +1,285 @@
 //! Binary entry point. The only place `shuvjobs-adapters` and `shuvjobs-tui` meet.
 
+mod cli;
+mod ops;
 mod remote;
 
-use std::path::PathBuf;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use shuvjobs_adapters::{AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter};
-use shuvjobs_core::{export, Error, ScheduledTask, TaskSource};
+use shuvjobs_core::export::{self, ExportTask};
+use shuvjobs_core::manage::MutationOutcome;
+use shuvjobs_core::{Op, ScheduledTask, TaskSourceKind};
 use shuvjobs_tui::RunOptions;
 
+use crate::cli::{Cli, Command, EditArgs, Global, IdArgs};
+use crate::ops::{CliError, ErrorReport, Report, Session};
 use crate::remote::RemoteCollector;
 
 /// `Send`: the TUI runs collection on a background worker thread.
 type RefreshFn = Box<dyn FnMut() -> Result<Vec<ScheduledTask>> + Send>;
 
-#[derive(Parser, Debug, Clone)]
-#[command(
-    name = "shuvjobs",
-    about = "ShuvJobs — inspect cron, systemd timer, at, anacron, and launchd jobs in one table",
-    version
-)]
-struct Cli {
-    /// Print collected tasks as JSON to stdout and exit (no TUI).
-    #[arg(long)]
-    json: bool,
-
-    /// Collect from a remote host over SSH (e.g. `alice@server.example.com`).
-    /// Key auth must be set up — shuvjobs runs ssh in BatchMode and never prompts.
-    #[arg(long, value_name = "USER@HOST")]
-    host: Option<String>,
-
-    /// SSH port for `--host`.
-    #[arg(long, requires = "host")]
-    port: Option<u16>,
-
-    /// SSH private key for `--host`.
-    #[arg(long, requires = "host", value_name = "PATH")]
-    key: Option<PathBuf>,
-
-    /// Run privileged scheduler commands and file writes through `sudo -n`.
-    /// Requires passwordless sudo on the target host; without it, operations
-    /// that need root fail early instead of prompting.
-    #[arg(long)]
-    sudo: bool,
-
-    /// Re-collect and redraw every N seconds.
-    #[arg(long, value_name = "SECONDS")]
-    refresh: Option<u64>,
+fn main() {
+    // Parse before anything else so `--json` is known when an error has
+    // to be reported; clap's own errors carry their own exit code.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => err.exit(),
+    };
+    let json = cli.global.json;
+    // What was being attempted, for the JSON error report. Filled in as
+    // soon as the subcommand knows; still `None` if we failed earlier.
+    let mut context = OpContext::default();
+    let code = match real_main(cli, &mut context) {
+        Ok(()) => 0,
+        Err(err) => {
+            report_error(&err, json, &context);
+            ops::exit_code(&err)
+        }
+    };
+    std::process::exit(code);
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+/// The `op` and `id` fields of the JSON error report.
+#[derive(Debug, Default)]
+struct OpContext {
+    op: Option<&'static str>,
+    id: Option<String>,
+}
 
-    if cli.json {
-        let tasks = collect_once(&cli)?;
-        println!("{}", export::serialize_tasks(&tasks)?);
-        return Ok(());
+fn real_main(cli: Cli, context: &mut OpContext) -> Result<()> {
+    cli.validate().map_err(CliError::Usage)?;
+    let global = cli.global.clone();
+    match cli.command {
+        // No subcommand: the historical behaviour, TUI or a JSON dump.
+        None if global.json => list(&global),
+        None => run_tui(&global, cli.refresh),
+        Some(Command::List) => list(&global),
+        Some(Command::Show(args)) => show(&global, &args, context),
+        Some(Command::Add(args)) => {
+            context.op = Some("add");
+            let session = Session::open(&global)?;
+            run_mutation(&session, &global, Op::Create(args.to_spec()?), context)
+        }
+        Some(Command::Edit(args)) => edit(&global, &args, context),
+        Some(Command::Rm(args)) => remove(&global, &args, context),
+        Some(Command::Enable(args)) => set_enabled(&global, &args, true, context),
+        Some(Command::Disable(args)) => set_enabled(&global, &args, false, context),
     }
+}
 
-    let (initial, refresh) = collect_with_refresh(&cli)?;
+fn list(global: &Global) -> Result<()> {
+    let session = Session::open(global)?;
+    let tasks = session.collect()?;
+    if global.json {
+        println!("{}", export::serialize_tasks(&tasks)?);
+    } else {
+        ops::print_table(&tasks);
+    }
+    Ok(())
+}
+
+fn show(global: &Global, args: &IdArgs, context: &mut OpContext) -> Result<()> {
+    context.op = Some("show");
+    context.id = Some(args.id.clone());
+    let session = Session::open(global)?;
+    let task = session.resolve(&args.id, args.source.map(TaskSourceKind::from))?;
+    if global.json {
+        let export = ExportTask::from(&task);
+        println!("{}", serde_json::to_string_pretty(&export)?);
+    } else {
+        ops::print_task(&task);
+    }
+    Ok(())
+}
+
+fn edit(global: &Global, args: &EditArgs, context: &mut OpContext) -> Result<()> {
+    context.op = Some("edit");
+    context.id = Some(args.target.id.clone());
+    let session = Session::open(global)?;
+    let existing = session.resolve(
+        &args.target.id,
+        args.target.source.map(TaskSourceKind::from),
+    )?;
+    let spec = ops::merge_edit(&existing, args)?;
+    run_mutation(
+        &session,
+        global,
+        Op::Update {
+            id: existing.id.clone(),
+            source: existing.source,
+            spec,
+        },
+        context,
+    )
+}
+
+fn remove(global: &Global, args: &IdArgs, context: &mut OpContext) -> Result<()> {
+    context.op = Some("rm");
+    context.id = Some(args.id.clone());
+    let session = Session::open(global)?;
+    let task = session.resolve(&args.id, args.source.map(TaskSourceKind::from))?;
+    // A dry run changes nothing, so there is nothing to confirm.
+    if !global.dry_run {
+        let prompt = format!(
+            "delete {} task {} [{}]?",
+            task.source, task.id, task.command
+        );
+        if !ops::confirm(&prompt, global.yes)? {
+            return Err(CliError::Aborted.into());
+        }
+    }
+    run_mutation(
+        &session,
+        global,
+        Op::Delete {
+            id: task.id.clone(),
+            source: task.source,
+        },
+        context,
+    )
+}
+
+fn set_enabled(
+    global: &Global,
+    args: &IdArgs,
+    enabled: bool,
+    context: &mut OpContext,
+) -> Result<()> {
+    context.op = Some(if enabled { "enable" } else { "disable" });
+    context.id = Some(args.id.clone());
+    let session = Session::open(global)?;
+    let task = session.resolve(&args.id, args.source.map(TaskSourceKind::from))?;
+    run_mutation(
+        &session,
+        global,
+        Op::SetEnabled {
+            id: task.id.clone(),
+            source: task.source,
+            enabled,
+        },
+        context,
+    )
+}
+
+/// The shared tail of every mutating subcommand: plan, maybe apply,
+/// then report in whichever format the operator asked for.
+fn run_mutation(session: &Session, global: &Global, op: Op, context: &mut OpContext) -> Result<()> {
+    context.op = Some(op.verb());
+    if let Some(id) = op.id() {
+        context.id = Some(id.to_string());
+    }
+    let mut backups: HashMap<String, String> = HashMap::new();
+    let outcome = if session.dry_run {
+        session.plan(&op)?
+    } else {
+        match session.apply(&op, &mut backups) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // The backups are the recovery path when an apply dies
+                // halfway, so say where they are even in JSON mode.
+                for (path, saved) in &backups {
+                    eprintln!("backup of {path}: {saved}");
+                }
+                return Err(err);
+            }
+        }
+    };
+
+    if global.json {
+        let report = Report::new(
+            &op,
+            &outcome,
+            session.host_label(),
+            session.dry_run,
+            session.policy(),
+            &backups,
+        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if session.dry_run {
+        print!("{}", session.render_plan(&outcome));
+    } else {
+        print_success(&op, &outcome, &backups);
+    }
+    Ok(())
+}
+
+fn print_success(op: &Op, outcome: &MutationOutcome, backups: &HashMap<String, String>) {
+    let id = outcome
+        .id
+        .as_deref()
+        .or_else(|| op.id())
+        .unwrap_or("(unnamed)");
+    println!("{} {} task {id}", past_tense(op), op.source());
+    for change in &outcome.changes {
+        match change {
+            shuvjobs_core::Change::WriteFile { path, .. }
+            | shuvjobs_core::Change::RemoveFile { path, .. } => {
+                let verb = if matches!(change, shuvjobs_core::Change::RemoveFile { .. }) {
+                    "removed"
+                } else {
+                    "wrote"
+                };
+                match backups.get(path) {
+                    Some(saved) => println!("  {verb} {path} (backup {saved})"),
+                    None => println!("  {verb} {path}"),
+                }
+            }
+            shuvjobs_core::Change::Command { cmd, .. } => println!("  ran {cmd}"),
+        }
+    }
+    for note in &outcome.notes {
+        println!("  note: {note}");
+    }
+}
+
+fn past_tense(op: &Op) -> &'static str {
+    match op {
+        Op::Create(_) => "added",
+        Op::Update { .. } => "edited",
+        Op::Delete { .. } => "removed",
+        Op::SetEnabled { enabled: true, .. } => "enabled",
+        Op::SetEnabled { enabled: false, .. } => "disabled",
+    }
+}
+
+fn report_error(err: &anyhow::Error, json: bool, context: &OpContext) {
+    if json {
+        let report = ErrorReport::new(err, context.op, context.id.clone());
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(_) => eprintln!("error: {err:#}"),
+        }
+    } else {
+        eprintln!("error: {err:#}");
+    }
+}
+
+fn run_tui(global: &Global, refresh_secs: Option<u64>) -> Result<()> {
+    let (initial, refresh) = collect_with_refresh(global)?;
     shuvjobs_tui::run(RunOptions {
         initial,
         refresh: Some(refresh),
-        refresh_secs: cli.refresh,
+        refresh_secs,
     })?;
     Ok(())
 }
 
-fn collect_once(cli: &Cli) -> Result<Vec<ScheduledTask>> {
-    if let Some(host) = &cli.host {
-        let collector =
-            RemoteCollector::new(host.clone(), cli.port, cli.key.clone()).with_sudo(cli.sudo);
-        collector
-            .collect()
-            .with_context(|| format!("collecting from {host}"))
-    } else {
-        Ok(collect_local())
-    }
-}
-
 /// Construct one [`RemoteCollector`] up front and move it into the
 /// refresh closure so the SSH multiplex master persists across reloads.
-fn collect_with_refresh(cli: &Cli) -> Result<(Vec<ScheduledTask>, RefreshFn)> {
-    if let Some(host) = &cli.host {
-        let collector =
-            RemoteCollector::new(host.clone(), cli.port, cli.key.clone()).with_sudo(cli.sudo);
+fn collect_with_refresh(global: &Global) -> Result<(Vec<ScheduledTask>, RefreshFn)> {
+    if let Some(host) = &global.host {
+        let collector = RemoteCollector::new(host.clone(), global.port, global.key.clone())
+            .with_sudo(global.sudo);
         let initial = collector
             .collect()
             .with_context(|| format!("collecting from {host}"))?;
         let refresh: RefreshFn = Box::new(move || collector.collect());
         Ok((initial, refresh))
     } else {
-        let initial = collect_local();
-        let refresh: RefreshFn = Box::new(|| Ok(collect_local()));
+        let initial = ops::collect_local();
+        let refresh: RefreshFn = Box::new(|| Ok(ops::collect_local()));
         Ok((initial, refresh))
     }
-}
-
-fn collect_local() -> Vec<ScheduledTask> {
-    let sources: Vec<Box<dyn TaskSource>> = vec![
-        Box::new(SystemdAdapter::new()),
-        Box::new(CronAdapter::new()),
-        Box::new(AtAdapter::new()),
-        Box::new(AnacronAdapter::new()),
-        Box::new(LaunchdAdapter::new()),
-    ];
-
-    let mut tasks: Vec<ScheduledTask> = Vec::new();
-    for source in &sources {
-        match source.collect() {
-            Ok(mut found) => tasks.append(&mut found),
-            Err(Error::Unavailable(_)) => continue,
-            Err(e) => eprintln!("warning: {} adapter failed: {e}", source.kind().as_str()),
-        }
-    }
-    tasks
 }
