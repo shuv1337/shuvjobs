@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::thread;
 
 use anyhow::{anyhow, bail, Result};
@@ -20,14 +21,21 @@ use shuvjobs_adapters::{
     cron::crontab_list_args,
     ids::RUN_PARTS,
     launchd::LaunchctlEntry,
+    process::{run_process, to_cmd_output},
     systemd::{
         show_unit_groups, split_task_id, Scope, SERVICE_SHOW_PROPERTIES, SHOW_CHUNK_SIZE,
         TIMER_SHOW_PROPERTIES,
     },
     AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter,
 };
-use shuvjobs_core::host::shell::{shell_quote, shell_safe_filename, shell_safe_username};
-use shuvjobs_core::{ScheduledTask, TaskStatus};
+use shuvjobs_core::host::shell::{
+    exists_script, list_dir_script, mkdir_script, read_file_script, remove_file_script, sh_c,
+    shell_quote, shell_safe_filename, shell_safe_username, write_file_script, ABSENT_EXIT,
+};
+use shuvjobs_core::host::{
+    privileged_command, CmdOutput, Host, HostOs, Privilege, PrivilegePolicy,
+};
+use shuvjobs_core::{Error as CoreError, Result as CoreResult, ScheduledTask, TaskStatus};
 
 /// Cap below sshd's default `MaxSessions` (10) so we never get refused
 /// channels on the remote side, even on the worst case of many small
@@ -46,6 +54,16 @@ pub struct RemoteCollector {
     /// SSH multiplex control socket. Per-process so concurrent `shuvjobs`
     /// invocations against the same host don't collide.
     control_path: PathBuf,
+    /// The operator's `--sudo`: may root operations be wrapped in `sudo -n --`.
+    sudo: bool,
+    /// Whether the SSH login user is uid 0. Probed at most once, and only
+    /// when some caller actually asks for the privilege policy.
+    root: OnceLock<bool>,
+    user: OnceLock<String>,
+    uid: OnceLock<u32>,
+    home: OnceLock<String>,
+    os: OnceLock<HostOs>,
+    offset: OnceLock<FixedOffset>,
 }
 
 /// Result of one `ssh user@host -- <cmd>` invocation. `NotFound` is
@@ -115,7 +133,20 @@ impl RemoteCollector {
             port,
             key_path,
             control_path,
+            sudo: false,
+            root: OnceLock::new(),
+            user: OnceLock::new(),
+            uid: OnceLock::new(),
+            home: OnceLock::new(),
+            os: OnceLock::new(),
+            offset: OnceLock::new(),
         }
+    }
+
+    /// Opt into `sudo -n --` for [`Privilege::Root`] operations.
+    pub fn with_sudo(mut self, sudo: bool) -> Self {
+        self.sudo = sudo;
+        self
     }
 
     /// Build the argv passed to `ssh` for running `cmd` on the remote.
@@ -154,13 +185,50 @@ impl RemoteCollector {
         args
     }
 
+    /// Run `cmd` on the remote host, optionally feeding it `stdin`, and
+    /// report how it finished.
+    ///
+    /// Only SSH itself failing is an `Err`: the remote command's own
+    /// non-zero exit is data, and the callers above decide what it means.
+    pub fn run_raw(
+        &self,
+        cmd: &str,
+        stdin: Option<&[u8]>,
+    ) -> std::result::Result<CmdOutput, RemoteCmdError> {
+        let mut command = Command::new("ssh");
+        command.args(self.ssh_argv(cmd));
+        let out = to_cmd_output(
+            run_process(&mut command, stdin)
+                .map_err(|e| RemoteCmdError::Ssh(anyhow!("invoking ssh: {e}")))?,
+        );
+        classify_raw(out.code, out.stdout, out.stderr)
+    }
+
     /// Run `cmd` on the remote host and return its stdout.
     pub fn run_command(&self, cmd: &str) -> std::result::Result<String, RemoteCmdError> {
-        let out = Command::new("ssh")
-            .args(self.ssh_argv(cmd))
-            .output()
-            .map_err(|e| RemoteCmdError::Ssh(anyhow!("invoking ssh: {e}")))?;
-        classify(out.status.code(), out.stdout, out.stderr)
+        let out = self.run_raw(cmd, None)?;
+        classify(out.code, out.stdout, out.stderr.into_bytes())
+    }
+
+    /// Stdout of an unprivileged probe (`id -u`, `uname -s`, …). Kept off
+    /// [`Host::run`] so asking who we are never has to ask whether we are
+    /// root first.
+    fn probe(&self, cmd: &str) -> CoreResult<String> {
+        self.run_raw(cmd, None)
+            .map_err(host_error)?
+            .require_success(cmd)
+    }
+
+    /// One file operation, rendered through the privilege wrapper.
+    fn file_op(
+        &self,
+        op: FileOp,
+        path: &str,
+        stdin: Option<&[u8]>,
+        privilege: Privilege,
+    ) -> CoreResult<CmdOutput> {
+        let cmd = file_op_command(op, path, privilege, self.policy())?;
+        self.run_raw(&cmd, stdin).map_err(host_error)
     }
 
     /// Collect from every supported source on the remote. Sources whose
@@ -242,6 +310,250 @@ impl Drop for RemoteCollector {
     }
 }
 
+/// The file operations [`Host`] performs over SSH, each one a pinned
+/// POSIX script from [`shuvjobs_core::host::shell`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOp {
+    Read,
+    Write { mode: u32 },
+    Remove,
+    Exists,
+    ListDir,
+    MkdirAll,
+}
+
+impl FileOp {
+    fn script(self, path: &str) -> String {
+        match self {
+            Self::Read => read_file_script(path),
+            Self::Write { mode } => write_file_script(path, mode),
+            Self::Remove => remove_file_script(path),
+            Self::Exists => exists_script(path),
+            Self::ListDir => list_dir_script(path),
+            Self::MkdirAll => mkdir_script(path),
+        }
+    }
+
+    /// What the operator sees in a `NeedsRoot` or command-failure message.
+    fn operation(self, path: &str) -> String {
+        let verb = match self {
+            Self::Read => "read",
+            Self::Write { .. } => "write",
+            Self::Remove => "remove",
+            Self::Exists => "check",
+            Self::ListDir => "list",
+            Self::MkdirAll => "mkdir",
+        };
+        format!("{verb} {path}")
+    }
+}
+
+/// Render `cmd` for `privilege` under `policy`, or refuse. Pure, so the
+/// exact strings that go over the wire are pinned by tests.
+pub fn remote_command(
+    cmd: &str,
+    privilege: Privilege,
+    policy: PrivilegePolicy,
+    operation: &str,
+) -> CoreResult<String> {
+    Ok(privileged_command(cmd, privilege, policy, operation)?.into_owned())
+}
+
+/// The full command line for one file operation: the pinned script,
+/// wrapped in `sh -c` because the remote login shell may be fish or zsh,
+/// then wrapped again by the privilege policy.
+pub fn file_op_command(
+    op: FileOp,
+    path: &str,
+    privilege: Privilege,
+    policy: PrivilegePolicy,
+) -> CoreResult<String> {
+    remote_command(
+        &sh_c(&op.script(path)),
+        privilege,
+        policy,
+        &op.operation(path),
+    )
+}
+
+/// A failed SSH round-trip is a transport failure, never the remote
+/// command's own verdict.
+fn host_error(error: RemoteCmdError) -> CoreError {
+    match error {
+        RemoteCmdError::Ssh(e) => CoreError::Transport(e.to_string()),
+        other => CoreError::Transport(other.to_string()),
+    }
+}
+
+fn parse_host_os(uname: &str) -> HostOs {
+    match uname.trim() {
+        "Darwin" => HostOs::MacOs,
+        "Linux" => HostOs::Linux,
+        _ => HostOs::Other,
+    }
+}
+
+/// The remote end of the execution seam. Reads go through
+/// [`CommandRunner`] as before; writes and privileged reads go through
+/// this impl, which renders the same scripts [`shuvjobs_adapters::LocalHost`]
+/// runs under sudo.
+impl Host for RemoteCollector {
+    fn policy(&self) -> PrivilegePolicy {
+        let is_root = *self.root.get_or_init(|| {
+            self.run_raw("id -u", None)
+                .is_ok_and(|out| out.success() && out.stdout_str().trim() == "0")
+        });
+        PrivilegePolicy {
+            is_root,
+            sudo: self.sudo,
+        }
+    }
+
+    fn label(&self) -> String {
+        self.host.clone()
+    }
+
+    fn current_user(&self) -> CoreResult<String> {
+        if let Some(user) = self.user.get() {
+            return Ok(user.clone());
+        }
+        let user = self.probe("id -un")?.trim().to_string();
+        if user.is_empty() {
+            return Err(CoreError::Other(format!(
+                "cannot determine the remote user on {}",
+                self.host
+            )));
+        }
+        let _ = self.user.set(user.clone());
+        Ok(user)
+    }
+
+    fn current_uid(&self) -> CoreResult<u32> {
+        if let Some(uid) = self.uid.get() {
+            return Ok(*uid);
+        }
+        let text = self.probe("id -u")?;
+        let uid: u32 = text
+            .trim()
+            .parse()
+            .map_err(|_| CoreError::Other(format!("invalid uid from {}: {text:?}", self.host)))?;
+        let _ = self.uid.set(uid);
+        Ok(uid)
+    }
+
+    fn home_dir(&self) -> CoreResult<String> {
+        if let Some(home) = self.home.get() {
+            return Ok(home.clone());
+        }
+        // `printf` rather than `echo $HOME`: no trailing newline of its
+        // own and no word splitting on a path with spaces.
+        let home = self.probe(r#"printf %s "$HOME""#)?.trim().to_string();
+        if home.is_empty() {
+            return Err(CoreError::Other(format!(
+                "cannot determine the home directory on {}: $HOME unset",
+                self.host
+            )));
+        }
+        let _ = self.home.set(home.clone());
+        Ok(home)
+    }
+
+    fn os(&self) -> CoreResult<HostOs> {
+        if let Some(os) = self.os.get() {
+            return Ok(*os);
+        }
+        let os = parse_host_os(&self.probe("uname -s")?);
+        let _ = self.os.set(os);
+        Ok(os)
+    }
+
+    fn utc_offset(&self) -> CoreResult<FixedOffset> {
+        if let Some(offset) = self.offset.get() {
+            return Ok(*offset);
+        }
+        let text = self.probe("date +%z")?;
+        let offset = parse_utc_offset(text.trim()).ok_or_else(|| {
+            CoreError::Other(format!("invalid UTC offset from {}: {text:?}", self.host))
+        })?;
+        let _ = self.offset.set(offset);
+        Ok(offset)
+    }
+
+    fn run(&self, cmd: &str, stdin: Option<&[u8]>, privilege: Privilege) -> CoreResult<CmdOutput> {
+        let rendered = remote_command(cmd, privilege, self.policy(), cmd)?;
+        self.run_raw(&rendered, stdin).map_err(host_error)
+    }
+
+    fn read_file(&self, path: &str, privilege: Privilege) -> CoreResult<Option<Vec<u8>>> {
+        let out = self.file_op(FileOp::Read, path, None, privilege)?;
+        if out.success() {
+            return Ok(Some(out.stdout));
+        }
+        if out.code == Some(ABSENT_EXIT) {
+            return Ok(None);
+        }
+        Err(failure(out, FileOp::Read, path))
+    }
+
+    fn write_file(
+        &self,
+        path: &str,
+        contents: &[u8],
+        mode: u32,
+        privilege: Privilege,
+    ) -> CoreResult<()> {
+        let op = FileOp::Write { mode };
+        self.file_op(op, path, Some(contents), privilege)?
+            .require_success(&op.operation(path))?;
+        Ok(())
+    }
+
+    fn remove_file(&self, path: &str, privilege: Privilege) -> CoreResult<bool> {
+        let out = self.file_op(FileOp::Remove, path, None, privilege)?;
+        if out.success() {
+            return Ok(true);
+        }
+        if out.code == Some(ABSENT_EXIT) {
+            return Ok(false);
+        }
+        Err(failure(out, FileOp::Remove, path))
+    }
+
+    fn exists(&self, path: &str, privilege: Privilege) -> CoreResult<bool> {
+        Ok(self
+            .file_op(FileOp::Exists, path, None, privilege)?
+            .success())
+    }
+
+    fn list_dir(&self, path: &str, privilege: Privilege) -> CoreResult<Vec<String>> {
+        let out = self.file_op(FileOp::ListDir, path, None, privilege)?;
+        if out.code == Some(ABSENT_EXIT) {
+            return Ok(Vec::new());
+        }
+        let listing = out.require_success(&FileOp::ListDir.operation(path))?;
+        let mut names: Vec<String> = listing
+            .lines()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    fn create_dir_all(&self, path: &str, privilege: Privilege) -> CoreResult<()> {
+        self.file_op(FileOp::MkdirAll, path, None, privilege)?
+            .require_success(&FileOp::MkdirAll.operation(path))?;
+        Ok(())
+    }
+}
+
+/// The error a non-zero, non-[`ABSENT_EXIT`] file operation deserves.
+fn failure(out: CmdOutput, op: FileOp, path: &str) -> CoreError {
+    out.require_success(&op.operation(path))
+        .expect_err("a non-zero exit cannot succeed")
+}
+
 /// One batched `systemctl show` for a chunk of units. The reply is one
 /// block per unit, keyed back to a unit by `Id=`.
 fn systemctl_show_cmd(scope: Scope, units: &[String], properties: &str) -> String {
@@ -308,6 +620,27 @@ fn classify(
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }),
         None => Err(RemoteCmdError::Ssh(anyhow!("ssh terminated by signal"))),
+    }
+}
+
+/// The transport-level half of [`classify`]: everything that is not SSH
+/// itself failing comes back as a [`CmdOutput`] for the caller to judge.
+fn classify_raw(
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: String,
+) -> std::result::Result<CmdOutput, RemoteCmdError> {
+    match code {
+        None => Err(RemoteCmdError::Ssh(anyhow!("ssh terminated by signal"))),
+        Some(255) => Err(RemoteCmdError::Ssh(anyhow!(
+            "ssh transport exited 255: {}",
+            stderr.trim()
+        ))),
+        _ => Ok(CmdOutput {
+            code,
+            stdout,
+            stderr,
+        }),
     }
 }
 
@@ -762,13 +1095,12 @@ mod tests {
     use super::*;
     use shuvjobs_core::ScheduleType;
 
+    /// A collector with a fixed control path, so the argv assertions
+    /// below don't depend on the test process's pid.
     fn collector() -> RemoteCollector {
-        RemoteCollector {
-            host: "alice@host".into(),
-            port: None,
-            key_path: None,
-            control_path: PathBuf::from("/tmp/shuvjobs-ssh-1"),
-        }
+        let mut coll = RemoteCollector::new("alice@host".into(), None, None);
+        coll.control_path = PathBuf::from("/tmp/shuvjobs-ssh-1");
+        coll
     }
 
     /// What the fixture runner returns for a command it has no fixture
@@ -855,12 +1187,9 @@ mod tests {
 
     #[test]
     fn ssh_argv_propagates_port_and_key() {
-        let coll = RemoteCollector {
-            host: "alice@host".into(),
-            port: Some(2222),
-            key_path: Some(PathBuf::from("/k")),
-            control_path: PathBuf::from("/tmp/shuvjobs-ssh-1"),
-        };
+        let mut coll =
+            RemoteCollector::new("alice@host".into(), Some(2222), Some(PathBuf::from("/k")));
+        coll.control_path = PathBuf::from("/tmp/shuvjobs-ssh-1");
         let argv = coll.ssh_argv("ls");
         // ssh doesn't care about flag order; assert by adjacency.
         let p_idx = argv.iter().position(|a| a == "-p").unwrap();
@@ -907,6 +1236,153 @@ mod tests {
     fn classify_signal_is_ssh_error() {
         let r = classify(None, Vec::new(), Vec::new()).unwrap_err();
         assert!(matches!(r, RemoteCmdError::Ssh(_)));
+    }
+
+    fn policy(is_root: bool, sudo: bool) -> PrivilegePolicy {
+        PrivilegePolicy { is_root, sudo }
+    }
+
+    #[test]
+    fn remote_command_renders_every_policy_branch() {
+        assert_eq!(
+            remote_command("crontab -l", Privilege::User, policy(false, false), "list").unwrap(),
+            "crontab -l"
+        );
+        assert_eq!(
+            remote_command("crontab -l", Privilege::Root, policy(true, false), "list").unwrap(),
+            "crontab -l"
+        );
+        assert_eq!(
+            remote_command("crontab -l", Privilege::Root, policy(false, true), "list").unwrap(),
+            "sudo -n -- crontab -l"
+        );
+        let err = remote_command(
+            "crontab -l",
+            Privilege::Root,
+            policy(false, false),
+            "read /etc/cron.d/x",
+        )
+        .expect_err("must refuse");
+        match err {
+            CoreError::NeedsRoot { operation } => assert_eq!(operation, "read /etc/cron.d/x"),
+            other => panic!("expected NeedsRoot, got {other:?}"),
+        }
+    }
+
+    /// The exact bytes each `Host` file operation puts on the wire. A path
+    /// containing a single quote goes through two rounds of quoting (the
+    /// script, then `sh -c`) and must survive both.
+    #[test]
+    fn file_op_commands_are_pinned() {
+        assert_eq!(
+            file_op_command(
+                FileOp::Read,
+                "/etc/cron.d/x",
+                Privilege::User,
+                policy(false, false)
+            )
+            .unwrap(),
+            r#"sh -c 'if test -e '\''/etc/cron.d/x'\''; then cat '\''/etc/cron.d/x'\''; else exit 66; fi'"#
+        );
+        assert_eq!(
+            file_op_command(
+                FileOp::Write { mode: 0o644 },
+                "/etc/cron.d/x",
+                Privilege::Root,
+                policy(false, true)
+            )
+            .unwrap(),
+            r#"sudo -n -- sh -c 'd=$(dirname '\''/etc/cron.d/x'\'') && t=$(mktemp "$d/.shuvjobs.XXXXXX") && { cat > "$t" && chmod 644 "$t" && mv -f "$t" '\''/etc/cron.d/x'\'' || { rm -f "$t"; exit 1; }; }'"#
+        );
+        assert_eq!(
+            file_op_command(
+                FileOp::Remove,
+                "/tmp/it's here/x",
+                Privilege::Root,
+                policy(false, true)
+            )
+            .unwrap(),
+            r#"sudo -n -- sh -c 'if test -e '\''/tmp/it'\''\'\'''\''s here/x'\''; then rm -f '\''/tmp/it'\''\'\'''\''s here/x'\''; else exit 66; fi'"#
+        );
+        assert_eq!(
+            file_op_command(
+                FileOp::Exists,
+                "/etc/anacrontab",
+                Privilege::User,
+                policy(false, false)
+            )
+            .unwrap(),
+            r#"sh -c 'test -e '\''/etc/anacrontab'\'''"#
+        );
+        assert_eq!(
+            file_op_command(
+                FileOp::ListDir,
+                "/etc/cron.d",
+                Privilege::User,
+                policy(false, false)
+            )
+            .unwrap(),
+            r#"sh -c 'if test -d '\''/etc/cron.d'\''; then ls -1A '\''/etc/cron.d'\''; else exit 66; fi'"#
+        );
+        assert_eq!(
+            file_op_command(
+                FileOp::MkdirAll,
+                "/etc/systemd/system",
+                Privilege::Root,
+                policy(true, false)
+            )
+            .unwrap(),
+            r#"sh -c 'mkdir -p '\''/etc/systemd/system'\'''"#
+        );
+        let err = file_op_command(
+            FileOp::Write { mode: 0o644 },
+            "/etc/cron.d/x",
+            Privilege::Root,
+            policy(false, false),
+        )
+        .expect_err("must refuse");
+        match err {
+            CoreError::NeedsRoot { operation } => assert_eq!(operation, "write /etc/cron.d/x"),
+            other => panic!("expected NeedsRoot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_raw_keeps_nonzero_exits_as_output() {
+        let out = classify_raw(Some(0), b"hi\n".to_vec(), String::new()).unwrap();
+        assert!(out.success());
+        assert_eq!(out.stdout_str(), "hi\n");
+
+        let out = classify_raw(Some(1), Vec::new(), "nope\n".to_string()).unwrap();
+        assert_eq!(out.code, Some(1));
+        assert_eq!(out.stderr, "nope\n");
+        assert!(!out.success());
+    }
+
+    #[test]
+    fn classify_raw_maps_transport_failures_to_ssh_errors() {
+        let err = classify_raw(Some(255), Vec::new(), "Permission denied".into()).unwrap_err();
+        assert!(matches!(err, RemoteCmdError::Ssh(_)));
+        assert!(err.to_string().contains("Permission denied"));
+
+        let err = classify_raw(None, Vec::new(), String::new()).unwrap_err();
+        assert!(matches!(err, RemoteCmdError::Ssh(_)));
+        assert!(err.to_string().contains("signal"));
+    }
+
+    #[test]
+    fn uname_maps_to_host_os() {
+        assert_eq!(parse_host_os("Darwin\n"), HostOs::MacOs);
+        assert_eq!(parse_host_os("Linux\n"), HostOs::Linux);
+        assert_eq!(parse_host_os("FreeBSD"), HostOs::Other);
+    }
+
+    #[test]
+    fn with_sudo_sets_the_policy_flag_and_label_is_the_host() {
+        let coll = collector().with_sudo(true);
+        assert!(coll.sudo);
+        assert_eq!(coll.label(), "alice@host");
+        assert!(!collector().sudo);
     }
 
     #[test]

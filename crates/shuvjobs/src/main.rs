@@ -39,6 +39,12 @@ struct Cli {
     #[arg(long, requires = "host", value_name = "PATH")]
     key: Option<PathBuf>,
 
+    /// Run privileged scheduler commands and file writes through `sudo -n`.
+    /// Requires passwordless sudo on the target host; without it, operations
+    /// that need root fail early instead of prompting.
+    #[arg(long)]
+    sudo: bool,
+
     /// Re-collect and redraw every N seconds.
     #[arg(long, value_name = "SECONDS")]
     refresh: Option<u64>,
@@ -64,7 +70,8 @@ fn main() -> Result<()> {
 
 fn collect_once(cli: &Cli) -> Result<Vec<ScheduledTask>> {
     if let Some(host) = &cli.host {
-        let collector = RemoteCollector::new(host.clone(), cli.port, cli.key.clone());
+        let collector =
+            RemoteCollector::new(host.clone(), cli.port, cli.key.clone()).with_sudo(cli.sudo);
         collector
             .collect()
             .with_context(|| format!("collecting from {host}"))
@@ -77,7 +84,8 @@ fn collect_once(cli: &Cli) -> Result<Vec<ScheduledTask>> {
 /// refresh closure so the SSH multiplex master persists across reloads.
 fn collect_with_refresh(cli: &Cli) -> Result<(Vec<ScheduledTask>, RefreshFn)> {
     if let Some(host) = &cli.host {
-        let collector = RemoteCollector::new(host.clone(), cli.port, cli.key.clone());
+        let collector =
+            RemoteCollector::new(host.clone(), cli.port, cli.key.clone()).with_sudo(cli.sudo);
         let initial = collector
             .collect()
             .with_context(|| format!("collecting from {host}"))?;
