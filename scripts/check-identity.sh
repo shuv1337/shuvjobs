@@ -33,6 +33,13 @@ grep -Fq 'Copyright (c) 2026 Ali Goren' LICENSE ||
 grep -Fq 'https://github.com/aligoren/sta' docs/FORK.md ||
   fail "upstream provenance is missing"
 
+for crate in shuvjobs-core shuvjobs-adapters shuvjobs-tui shuvjobs; do
+  grep -Fqx 'license.workspace = true' "crates/$crate/Cargo.toml" ||
+    fail "crates/$crate does not inherit the workspace license"
+  cmp -s LICENSE "crates/$crate/LICENSE" ||
+    fail "crates/$crate/LICENSE does not match the root LICENSE"
+done
+
 if matches=$(find . -type f \
   ! -path './target/*' \
   ! -path './.git/*' \

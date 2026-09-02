@@ -9,7 +9,9 @@
 - Raise the minimum supported Rust version from 1.75 to 1.88.
 - Upgrade Ratatui, Crossterm, plist, and transitive dependencies to resolve
   current RustSec advisories.
-- Publish fork crates under the MIT license while retaining the upstream notice.
+- Publish fork crates under the standard SPDX `MIT` license expression inherited
+  from the workspace, with a copy of the upstream MIT notice packaged in every
+  crate archive.
 - Derive systemd status from the bound service instead of the timer unit, so
   failed and in-flight activations are reported; populate run duration from the
   service's main-process timestamps.

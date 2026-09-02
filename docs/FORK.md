@@ -2,9 +2,12 @@
 
 ShuvJobs is a maintained fork of [Ali Goren's `sta`](https://github.com/aligoren/sta),
 based on upstream revision `7957527f6f39f8ed65fa5e3e49c7b5a27dfeada4` (`v0.1.2`).
-The fork narrows the upstream `MIT OR Apache-2.0` package declaration to MIT;
-the upstream MIT license and copyright notice remain intact and are included in
-every crate archive.
+The fork narrows the upstream `MIT OR Apache-2.0` package declaration to MIT.
+Every workspace crate declares the standard SPDX expression `MIT` through
+`license.workspace = true`, and each crate directory carries a verbatim copy of
+the root `LICENSE`, so the upstream MIT license and copyright notice remain
+intact and ship in every crate archive. `scripts/check-identity.sh` fails if any
+crate copy drifts from the root `LICENSE`.
 
 ## Canonical Identity
 
