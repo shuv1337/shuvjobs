@@ -12,6 +12,8 @@ use std::process::Command;
 use chrono::{DateTime, Local, TimeZone, Utc};
 use shuvjobs_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
 
+use crate::ids::RUN_PARTS;
+
 #[derive(Debug, Default)]
 pub struct CronAdapter;
 
@@ -138,15 +140,9 @@ impl TaskSource for CronAdapter {
     fn collect(&self) -> Result<Vec<ScheduledTask>> {
         let etc_crontab = Path::new("/etc/crontab");
         let cron_d = Path::new("/etc/cron.d");
-        let run_parts_dirs = [
-            ("hourly", "/etc/cron.hourly"),
-            ("daily", "/etc/cron.daily"),
-            ("weekly", "/etc/cron.weekly"),
-            ("monthly", "/etc/cron.monthly"),
-        ];
         let crontab_bin_present = which("crontab").is_some();
 
-        let any_run_parts = run_parts_dirs.iter().any(|(_, p)| Path::new(p).exists());
+        let any_run_parts = RUN_PARTS.iter().any(|(_, p)| Path::new(p).exists());
         if !etc_crontab.exists() && !cron_d.exists() && !any_run_parts && !crontab_bin_present {
             return Err(Error::Unavailable(
                 "no cron files or `crontab` binary".into(),
@@ -176,7 +172,7 @@ impl TaskSource for CronAdapter {
             }
         }
 
-        for (period, dir) in run_parts_dirs {
+        for (period, dir) in RUN_PARTS {
             let scripts = list_run_parts_scripts(Path::new(dir));
             if scripts.is_empty() {
                 continue;

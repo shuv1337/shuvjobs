@@ -18,6 +18,7 @@ use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 use shuvjobs_adapters::{
     anacron::run_times_from_spool,
     cron::crontab_list_args,
+    ids::RUN_PARTS,
     launchd::LaunchctlEntry,
     systemd::{
         show_unit_groups, split_task_id, Scope, SERVICE_SHOW_PROPERTIES, SHOW_CHUNK_SIZE,
@@ -508,12 +509,7 @@ fn collect_cron(
     }
 
     // run-parts directories. Just 4 ls calls — keep serial.
-    for (period, dir) in [
-        ("hourly", "/etc/cron.hourly"),
-        ("daily", "/etc/cron.daily"),
-        ("weekly", "/etc/cron.weekly"),
-        ("monthly", "/etc/cron.monthly"),
-    ] {
+    for (period, dir) in RUN_PARTS {
         let cmd = format!("ls -1 {} 2>/dev/null", shell_quote(dir));
         if let Some(listing) = optional_remote_output(runner.run(&cmd))? {
             any_present = true;

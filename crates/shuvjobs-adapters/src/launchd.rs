@@ -276,7 +276,7 @@ fn next_calendar_run<Tz: TimeZone>(value: &Value, now: DateTime<Tz>) -> Option<D
 
 /// Render a `StartCalendarInterval` (dict or array of dicts) as
 /// `Hour=9 Minute=0` style. Lossy but stable.
-fn format_calendar_interval(value: &Value) -> String {
+pub(crate) fn format_calendar_interval(value: &Value) -> String {
     fn dict_to_string(d: &plist::Dictionary) -> String {
         let mut parts = Vec::new();
         for key in ["Minute", "Hour", "Day", "Weekday", "Month"] {

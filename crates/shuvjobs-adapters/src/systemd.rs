@@ -536,7 +536,7 @@ fn extract_monotonic_value(record: &str) -> Option<String> {
 }
 
 /// systemd duration: `15min`, `1h`, `30s`, `1h30min`, `500ms`.
-fn parse_systemd_duration(s: &str) -> Option<Duration> {
+pub(crate) fn parse_systemd_duration(s: &str) -> Option<Duration> {
     let mut total = Duration::ZERO;
     let mut digits = String::new();
     let mut chars = s.chars().peekable();
