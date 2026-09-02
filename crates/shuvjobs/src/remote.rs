@@ -508,19 +508,38 @@ fn collect_cron(
         }
     }
 
-    // run-parts directories. Just 4 ls calls — keep serial.
+    // run-parts directories: one `ls` for the names plus one `find` for
+    // the executable bits (run-parts skips non-executable files). Eight
+    // small commands — keep serial.
     for (period, dir) in RUN_PARTS {
         let cmd = format!("ls -1 {} 2>/dev/null", shell_quote(dir));
         if let Some(listing) = optional_remote_output(runner.run(&cmd))? {
             any_present = true;
-            let scripts: Vec<&str> = listing
+            let names: Vec<&str> = listing
                 .lines()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
-            if !scripts.is_empty() {
-                tasks.extend(CronAdapter::parse_run_parts_at(period, &scripts, dir, now));
+            if names.is_empty() {
+                continue;
             }
+            let executable = optional_remote_output(runner.run(&run_parts_find_cmd(dir)))?;
+            // No `find` output at all means "unknown", not "none are
+            // executable" — a locked-down or `find`-less host must not
+            // report every script as disabled.
+            let executable: Option<std::collections::HashSet<&str>> =
+                executable.as_deref().map(|text| {
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|path| path.rsplit('/').next())
+                        .collect()
+                });
+            let scripts: Vec<(&str, Option<bool>)> = names
+                .iter()
+                .map(|name| (*name, executable.as_ref().map(|set| set.contains(name))))
+                .collect();
+            tasks.extend(CronAdapter::parse_run_parts_at(period, &scripts, dir, now));
         }
     }
 
@@ -559,6 +578,14 @@ fn collect_cron(
         return Err(RemoteSourceError::Unavailable);
     }
     Ok(tasks)
+}
+
+/// Files in a run-parts directory that carry the owner execute bit.
+fn run_parts_find_cmd(dir: &str) -> String {
+    format!(
+        "find {} -maxdepth 1 -type f -perm -u+x 2>/dev/null",
+        shell_quote(dir)
+    )
 }
 
 fn collect_launchd(
@@ -602,7 +629,7 @@ fn collect_launchd(
         let Some(content) = content_opt? else {
             continue;
         };
-        match LaunchdAdapter::parse_plist_at(content.as_bytes(), now) {
+        match LaunchdAdapter::parse_plist_at(content.as_bytes(), &path, now) {
             Ok(Some(mut task)) => {
                 let rt_entry = runtime.get(&task.id);
                 apply_launchctl_runtime(&mut task, rt_entry);
@@ -715,6 +742,9 @@ where
 /// Merge `launchctl list` runtime state onto a plist-parsed task.
 fn apply_launchctl_runtime(task: &mut ScheduledTask, entry: Option<&LaunchctlEntry>) {
     let Some(rt) = entry else { return };
+    // Listed by launchd means loaded, whatever the plist's `Disabled`
+    // key says. (`launchctl print-disabled` is not consulted yet.)
+    task.enabled = Some(true);
     task.last_status = rt.last_exit_status.map(|code| {
         if code == 0 {
             TaskStatus::Success
@@ -903,6 +933,9 @@ mod tests {
     // Batched `systemctl show` replies: one block per unit, `Id=` first.
     const SYSTEMD_SHOW_TIMER: &str = "\
 Id=logrotate.timer
+ActiveState=active
+FragmentPath=/usr/lib/systemd/system/logrotate.timer
+UnitFileState=enabled
 TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Sat 2026-04-11 17:04:57 +03 }
 Result=success
 ";
@@ -928,7 +961,7 @@ ExecMainExitTimestampMonotonic=40202376368
             SYSTEMD_LIST,
         );
         fx.insert(
-            "systemctl show 'logrotate.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
+            "systemctl show 'logrotate.timer' --property=Id,TimersCalendar,TimersMonotonic,Result,FragmentPath,UnitFileState,ActiveState --no-pager",
             SYSTEMD_SHOW_TIMER,
         );
         fx.insert(
@@ -949,6 +982,11 @@ ExecMainExitTimestampMonotonic=40202376368
             t.last_duration,
             Some(std::time::Duration::from_micros(24_615))
         );
+        assert_eq!(
+            t.location.as_deref(),
+            Some("/usr/lib/systemd/system/logrotate.timer")
+        );
+        assert_eq!(t.enabled, Some(true));
     }
 
     // Captured from `systemctl --user list-timers --all --output=json
@@ -958,6 +996,9 @@ ExecMainExitTimestampMonotonic=40202376368
     ]"#;
     const SYSTEMD_USER_SHOW_TIMER: &str = "\
 Id=radar-daily.timer
+ActiveState=active
+FragmentPath=/home/alice/.config/systemd/user/radar-daily.timer
+UnitFileState=enabled
 TimersCalendar={ OnCalendar=*-*-* 09:15:00 ; next_elapse=Thu 2026-09-03 09:15:00 PDT }
 Result=success
 ";
@@ -989,7 +1030,7 @@ ExecMainExitTimestampMonotonic=40202376368
             SYSTEMD_USER_LIST,
         );
         fx.insert(
-            "systemctl show 'logrotate.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
+            "systemctl show 'logrotate.timer' --property=Id,TimersCalendar,TimersMonotonic,Result,FragmentPath,UnitFileState,ActiveState --no-pager",
             SYSTEMD_SHOW_TIMER,
         );
         fx.insert(
@@ -997,7 +1038,7 @@ ExecMainExitTimestampMonotonic=40202376368
             SYSTEMD_SHOW_SERVICE,
         );
         fx.insert(
-            "systemctl --user show 'radar-daily.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
+            "systemctl --user show 'radar-daily.timer' --property=Id,TimersCalendar,TimersMonotonic,Result,FragmentPath,UnitFileState,ActiveState --no-pager",
             SYSTEMD_USER_SHOW_TIMER,
         );
         fx.insert(
@@ -1016,6 +1057,11 @@ ExecMainExitTimestampMonotonic=40202376368
         assert_eq!(user.command, "/home/alice/.local/bin/radar daily");
         assert!(matches!(user.schedule, ScheduleType::Calendar(ref s) if s == "*-*-* 09:15:00"));
         assert!(matches!(user.last_status, Some(TaskStatus::Success)));
+        assert_eq!(
+            user.location.as_deref(),
+            Some("/home/alice/.config/systemd/user/radar-daily.timer")
+        );
+        assert_eq!(user.enabled, Some(true));
     }
 
     /// No user bus (the common non-lingering SSH case): `systemctl --user`
@@ -1032,7 +1078,7 @@ ExecMainExitTimestampMonotonic=40202376368
             SYSTEMD_LIST,
         );
         fx.insert(
-            "systemctl show 'logrotate.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
+            "systemctl show 'logrotate.timer' --property=Id,TimersCalendar,TimersMonotonic,Result,FragmentPath,UnitFileState,ActiveState --no-pager",
             SYSTEMD_SHOW_TIMER,
         );
         fx.insert(
@@ -1114,7 +1160,7 @@ ExecMainExitTimestampMonotonic=40202376368
         // Units are sorted, so `logrotate` precedes `man-db`; one command
         // for both timers and one for both services.
         fx.insert(
-            "systemctl show 'logrotate.timer' 'man-db.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
+            "systemctl show 'logrotate.timer' 'man-db.timer' --property=Id,TimersCalendar,TimersMonotonic,Result,FragmentPath,UnitFileState,ActiveState --no-pager",
             SYSTEMD_SHOW_TIMER_BATCH,
         );
         fx.insert(
@@ -1159,7 +1205,7 @@ ExecMainExitTimestampMonotonic=40202376368
             SYSTEMD_LIST_TWO,
         );
         fx.insert(
-            "systemctl show 'logrotate.timer' 'man-db.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
+            "systemctl show 'logrotate.timer' 'man-db.timer' --property=Id,TimersCalendar,TimersMonotonic,Result,FragmentPath,UnitFileState,ActiveState --no-pager",
             "Id=man-db.timer\nTimersCalendar={ OnCalendar=daily ; next_elapse=Wed 2026-09-02 00:00:00 PDT }\nResult=success\n",
         );
 
@@ -1305,6 +1351,39 @@ ExecMainExitTimestampMonotonic=40202376368
     }
 
     #[test]
+    fn cron_run_parts_reports_the_executable_bit_and_the_script_path() {
+        let mut fx = HashMap::new();
+        fx.insert(
+            "ls -1 '/etc/cron.daily' 2>/dev/null",
+            "logrotate\nmlocate\n",
+        );
+        fx.insert(
+            "find '/etc/cron.daily' -maxdepth 1 -type f -perm -u+x 2>/dev/null",
+            "/etc/cron.daily/logrotate\n",
+        );
+        let tasks = collect_cron(&FixtureRunner::new(fx), remote_now()).unwrap();
+        assert_eq!(tasks.len(), 2, "got {tasks:?}");
+        assert_eq!(tasks[0].id, "/etc/cron.daily/logrotate");
+        assert_eq!(
+            tasks[0].location.as_deref(),
+            Some("/etc/cron.daily/logrotate")
+        );
+        assert_eq!(tasks[0].enabled, Some(true));
+        assert_eq!(tasks[1].id, "/etc/cron.daily/mlocate");
+        assert_eq!(tasks[1].enabled, Some(false));
+    }
+
+    /// Without a usable `find` the executable bit is unknown, not false.
+    #[test]
+    fn cron_run_parts_leaves_the_executable_bit_unknown_without_find() {
+        let mut fx = HashMap::new();
+        fx.insert("ls -1 '/etc/cron.daily' 2>/dev/null", "logrotate\n");
+        let tasks = collect_cron(&FixtureRunner::new(fx), remote_now()).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].enabled, None);
+    }
+
+    #[test]
     fn cron_unavailable_when_nothing_found() {
         let err = collect_cron(&FixtureRunner::always(Fallback::Failed), remote_now()).unwrap_err();
         assert!(matches!(err, RemoteSourceError::Unavailable));
@@ -1404,6 +1483,12 @@ ExecMainExitTimestampMonotonic=40202376368
             tasks[0].schedule,
             ScheduleType::Interval(d) if d == std::time::Duration::from_secs(900)
         ));
+        assert_eq!(
+            tasks[0].location.as_deref(),
+            Some("/Library/LaunchAgents/com.example.heartbeat.plist")
+        );
+        // Present in `launchctl list` — loaded, so enabled.
+        assert_eq!(tasks[0].enabled, Some(true));
     }
 
     #[test]

@@ -52,3 +52,8 @@
   backing file (cron file, systemd `FragmentPath`, anacrontab, launchd
   plist) and `enabled` is whether the job would run, both `null` when the
   source has no such notion. Older JSON without the keys still loads.
+- Populate those two fields for every source: systemd timers report
+  `FragmentPath` and their `UnitFileState`/`ActiveState` enablement, cron
+  file entries report their file, run-parts scripts report their path and
+  executable bit, anacron entries report `/etc/anacrontab`, and launchd
+  jobs report their plist and whether launchd has them loaded.

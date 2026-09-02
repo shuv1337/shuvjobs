@@ -12,6 +12,11 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use shuvjobs_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
 
+use crate::lineedit::strip_disabled_marker;
+
+/// The only file anacron jobs can come from.
+pub const ANACRONTAB_PATH: &str = "/etc/anacrontab";
+
 #[derive(Debug, Default)]
 pub struct AnacronAdapter;
 
@@ -25,7 +30,13 @@ impl AnacronAdapter {
     pub fn parse_anacrontab(contents: &str) -> Vec<ScheduledTask> {
         let mut out = Vec::new();
         for raw in contents.lines() {
-            let line = raw.trim();
+            let trimmed = raw.trim();
+            // A shuvjobs-disabled marker hides a real entry behind a
+            // comment; ordinary comments are still skipped.
+            let (line, enabled) = match strip_disabled_marker(trimmed) {
+                Some(rest) => (rest.trim(), false),
+                None => (trimmed, true),
+            };
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -51,8 +62,8 @@ impl AnacronAdapter {
                 last_duration: None,
                 next_run: None,
                 command: entry.command,
-                location: None,
-                enabled: None,
+                location: Some(ANACRONTAB_PATH.to_string()),
+                enabled: Some(enabled),
             });
         }
         out
@@ -74,7 +85,7 @@ impl TaskSource for AnacronAdapter {
     }
 
     fn collect(&self) -> Result<Vec<ScheduledTask>> {
-        let anacrontab = Path::new("/etc/anacrontab");
+        let anacrontab = Path::new(ANACRONTAB_PATH);
         if !anacrontab.exists() {
             return Err(Error::Unavailable("/etc/anacrontab not present".into()));
         }
@@ -345,6 +356,30 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
         let text = "abc 5 cron.daily run-parts /etc/cron.daily\n";
         let tasks = AnacronAdapter::parse_anacrontab(text);
         assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn entries_carry_the_anacrontab_location() {
+        let tasks = AnacronAdapter::parse_anacrontab(STANDARD_ANACRONTAB);
+        assert!(tasks
+            .iter()
+            .all(|t| t.location.as_deref() == Some("/etc/anacrontab")));
+        assert!(tasks.iter().all(|t| t.enabled == Some(true)));
+    }
+
+    #[test]
+    fn disabled_marker_entry_parses_as_disabled() {
+        let text = "\
+# period delay job command
+#shuvjobs-disabled# 1 5 cron.daily run-parts /etc/cron.daily
+7 25 cron.weekly run-parts /etc/cron.weekly
+";
+        let tasks = AnacronAdapter::parse_anacrontab(text);
+        assert_eq!(tasks.len(), 2, "got {tasks:?}");
+        assert_eq!(tasks[0].id, "anacron:cron.daily");
+        assert_eq!(tasks[0].enabled, Some(false));
+        assert_eq!(tasks[0].command, "run-parts /etc/cron.daily");
+        assert_eq!(tasks[1].enabled, Some(true));
     }
 
     #[test]

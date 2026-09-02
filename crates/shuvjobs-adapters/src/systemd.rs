@@ -155,6 +155,15 @@ impl SystemdAdapter {
                 "Result" if !value.is_empty() => {
                     out.result = Some(value.to_string());
                 }
+                "FragmentPath" if !value.is_empty() => {
+                    out.fragment_path = Some(value.to_string());
+                }
+                "UnitFileState" if !value.is_empty() => {
+                    out.unit_file_state = Some(value.to_string());
+                }
+                "ActiveState" if !value.is_empty() => {
+                    out.active_state = Some(value.to_string());
+                }
                 _ => {}
             }
         }
@@ -233,6 +242,13 @@ impl SystemdAdapter {
             }
         }
 
+        if let Some(timer) = &timer {
+            if let Some(path) = &timer.fragment_path {
+                task.location = Some(path.clone());
+            }
+            task.enabled = timer.enabled();
+        }
+
         if let Some(service) = &service {
             if let Some(cmd) = &service.exec_start {
                 task.command = cmd.clone();
@@ -250,7 +266,8 @@ pub const SERVICE_SHOW_PROPERTIES: &str = "Id,ExecStart,Result,ActiveState,SubSt
 ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic";
 
 /// Properties requested from the timer unit itself.
-pub const TIMER_SHOW_PROPERTIES: &str = "Id,TimersCalendar,TimersMonotonic,Result";
+pub const TIMER_SHOW_PROPERTIES: &str =
+    "Id,TimersCalendar,TimersMonotonic,Result,FragmentPath,UnitFileState,ActiveState";
 
 /// Upper bound on units passed to a single `systemctl show`. Batching is
 /// the whole point, but an unbounded argv would eventually hit `ARG_MAX`
@@ -423,6 +440,34 @@ pub struct ShowTimer {
     pub on_calendar: Option<String>,
     pub on_interval: Option<Duration>,
     pub result: Option<String>,
+    /// Path of the unit file backing this timer, empty for transient
+    /// units.
+    pub fragment_path: Option<String>,
+    /// `enabled`, `disabled`, `static`, `masked`, ... — empty for units
+    /// systemd has no install information for.
+    pub unit_file_state: Option<String>,
+    pub active_state: Option<String>,
+}
+
+impl ShowTimer {
+    /// Whether the timer will fire on its own.
+    ///
+    /// `UnitFileState` answers this directly for units with install
+    /// information. `static`, `indirect`, `generated`, `transient`,
+    /// `bad` and anything newer have no enablement to speak of, so the
+    /// honest answer is whether the timer is currently loaded and
+    /// running — `ActiveState=active`.
+    pub fn enabled(&self) -> Option<bool> {
+        let active = self.active_state.as_deref();
+        match self.unit_file_state.as_deref() {
+            Some("enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "alias") => {
+                Some(true)
+            }
+            Some("disabled" | "masked" | "masked-runtime") => Some(false),
+            Some(_) => Some(active == Some("active")),
+            None => active.map(|state| state == "active"),
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -698,6 +743,91 @@ mod tests {
         let parsed = SystemdAdapter::parse_show_timer(SHOW_TIMER_INTERVAL);
         assert!(parsed.on_calendar.is_none());
         assert_eq!(parsed.on_interval, Some(Duration::from_secs(15 * 60)));
+    }
+
+    // Captured verbatim from
+    //   systemctl show snapper-cleanup.timer \
+    //     --property=Id,TimersCalendar,TimersMonotonic,Result,FragmentPath,UnitFileState,ActiveState \
+    //     --no-pager
+    // on an Arch host. Two TimersMonotonic lines; only the first is used.
+    const SHOW_TIMER_ENABLED: &str = "\
+Id=snapper-cleanup.timer
+ActiveState=active
+FragmentPath=/usr/lib/systemd/system/snapper-cleanup.timer
+UnitFileState=enabled
+TimersMonotonic={ OnUnitActiveUSec=1h ; next_elapse=4h 10min 1.368734s }
+TimersMonotonic={ OnBootUSec=10min ; next_elapse=10min }
+Result=success
+";
+
+    #[test]
+    fn parse_show_timer_extracts_fragment_path_and_states() {
+        let parsed = SystemdAdapter::parse_show_timer(SHOW_TIMER_ENABLED);
+        assert_eq!(
+            parsed.fragment_path.as_deref(),
+            Some("/usr/lib/systemd/system/snapper-cleanup.timer")
+        );
+        assert_eq!(parsed.unit_file_state.as_deref(), Some("enabled"));
+        assert_eq!(parsed.active_state.as_deref(), Some("active"));
+        assert_eq!(parsed.on_interval, Some(Duration::from_secs(3600)));
+        assert_eq!(parsed.enabled(), Some(true));
+    }
+
+    /// The full `UnitFileState` → `enabled` mapping, including the
+    /// install-less states that fall back to `ActiveState`.
+    #[test]
+    fn enabled_maps_every_unit_file_state() {
+        let cases: [(Option<&str>, Option<&str>, Option<bool>); 11] = [
+            (Some("enabled"), Some("inactive"), Some(true)),
+            (Some("enabled-runtime"), None, Some(true)),
+            (Some("linked"), None, Some(true)),
+            (Some("alias"), None, Some(true)),
+            (Some("disabled"), Some("active"), Some(false)),
+            (Some("masked"), None, Some(false)),
+            (Some("masked-runtime"), None, Some(false)),
+            (Some("static"), Some("active"), Some(true)),
+            (Some("static"), Some("inactive"), Some(false)),
+            (Some("generated"), None, Some(false)),
+            (None, None, None),
+        ];
+        for (state, active, want) in cases {
+            let timer = ShowTimer {
+                unit_file_state: state.map(str::to_string),
+                active_state: active.map(str::to_string),
+                ..ShowTimer::default()
+            };
+            assert_eq!(timer.enabled(), want, "state={state:?} active={active:?}");
+        }
+    }
+
+    /// A transient timer has no unit file at all: only `ActiveState`.
+    #[test]
+    fn enabled_falls_back_to_active_state_without_a_unit_file_state() {
+        let parsed = SystemdAdapter::parse_show_timer(
+            "Id=x.timer\nFragmentPath=\nUnitFileState=\nActiveState=active\n",
+        );
+        assert!(parsed.fragment_path.is_none());
+        assert!(parsed.unit_file_state.is_none());
+        assert_eq!(parsed.enabled(), Some(true));
+    }
+
+    #[test]
+    fn apply_show_sets_location_and_enabled_from_the_timer() {
+        let mut task = listed_task(true);
+        SystemdAdapter::apply_show(&mut task, Some(SHOW_TIMER_ENABLED), None);
+        assert_eq!(
+            task.location.as_deref(),
+            Some("/usr/lib/systemd/system/snapper-cleanup.timer")
+        );
+        assert_eq!(task.enabled, Some(true));
+    }
+
+    #[test]
+    fn apply_show_leaves_location_and_enabled_unset_without_a_timer_block() {
+        let mut task = listed_task(true);
+        SystemdAdapter::apply_show(&mut task, None, None);
+        assert_eq!(task.location, None);
+        assert_eq!(task.enabled, None);
     }
 
     const SHOW_SERVICE_FIXTURE: &str = "ExecStart={ path=/usr/sbin/logrotate ; argv[]=/usr/sbin/logrotate /etc/logrotate.conf ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n";

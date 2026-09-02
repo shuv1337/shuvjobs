@@ -13,6 +13,7 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use shuvjobs_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
 
 use crate::ids::RUN_PARTS;
+use crate::lineedit::strip_disabled_marker;
 
 #[derive(Debug, Default)]
 pub struct CronAdapter;
@@ -35,9 +36,19 @@ impl CronAdapter {
         has_user_field: bool,
         now: DateTime<Tz>,
     ) -> Vec<ScheduledTask> {
+        // File-backed crontabs (`/etc/crontab`, `/etc/cron.d/*`) have a
+        // path worth reporting; `user:<name>` origins are not paths, so
+        // they get no location.
+        let location = has_user_field.then(|| origin.to_string());
         let mut out = Vec::new();
         for (idx, raw) in contents.lines().enumerate() {
-            let line = raw.trim();
+            let trimmed = raw.trim();
+            // A shuvjobs-disabled marker hides a real job behind a
+            // comment: parse the remainder, keep the true line number.
+            let (line, enabled) = match strip_disabled_marker(trimmed) {
+                Some(rest) => (rest.trim(), false),
+                None => (trimmed, true),
+            };
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -71,21 +82,28 @@ impl CronAdapter {
                 last_duration: None,
                 next_run,
                 command,
-                location: None,
-                enabled: None,
+                location: location.clone(),
+                enabled: Some(enabled),
             });
         }
         out
     }
 
-    /// `period` is one of `hourly`/`daily`/`weekly`/`monthly`.
-    pub fn parse_run_parts(period: &str, scripts: &[&str], dir: &str) -> Vec<ScheduledTask> {
+    /// `period` is one of `hourly`/`daily`/`weekly`/`monthly`. Each
+    /// script carries its executable bit, which is what decides whether
+    /// `run-parts` will actually run it; `None` when the caller could
+    /// not determine it.
+    pub fn parse_run_parts(
+        period: &str,
+        scripts: &[(&str, Option<bool>)],
+        dir: &str,
+    ) -> Vec<ScheduledTask> {
         Self::parse_run_parts_at(period, scripts, dir, Local::now())
     }
 
     pub fn parse_run_parts_at<Tz: TimeZone>(
         period: &str,
-        scripts: &[&str],
+        scripts: &[(&str, Option<bool>)],
         dir: &str,
         now: DateTime<Tz>,
     ) -> Vec<ScheduledTask> {
@@ -93,7 +111,7 @@ impl CronAdapter {
         let next_run = compute_next_run(&schedule, now);
         scripts
             .iter()
-            .map(|script| ScheduledTask {
+            .map(|(script, executable)| ScheduledTask {
                 id: format!("{dir}/{script}"),
                 name: (*script).to_string(),
                 source: TaskSourceKind::Cron,
@@ -103,8 +121,8 @@ impl CronAdapter {
                 last_duration: None,
                 next_run,
                 command: format!("{dir}/{script}"),
-                location: None,
-                enabled: None,
+                location: Some(format!("{dir}/{script}")),
+                enabled: *executable,
             })
             .collect()
     }
@@ -177,7 +195,10 @@ impl TaskSource for CronAdapter {
             if scripts.is_empty() {
                 continue;
             }
-            let refs: Vec<&str> = scripts.iter().map(String::as_str).collect();
+            let refs: Vec<(&str, Option<bool>)> = scripts
+                .iter()
+                .map(|(name, exec)| (name.as_str(), *exec))
+                .collect();
             tasks.extend(Self::parse_run_parts(period, &refs, dir));
         }
 
@@ -316,7 +337,9 @@ fn is_login_shell(shell: &str) -> bool {
     )
 }
 
-fn list_run_parts_scripts(dir: &Path) -> Vec<String> {
+/// `(script name, executable bit)` for every file in a run-parts dir.
+/// The executable bit is `None` on platforms without unix permissions.
+fn list_run_parts_scripts(dir: &Path) -> Vec<(String, Option<bool>)> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -330,11 +353,27 @@ fn list_run_parts_scripts(dir: &Path) -> Vec<String> {
             // run-parts itself skips dot-containing names but we surface
             // them anyway — orphaned scripts are exactly the kind of
             // thing the audit is for.
-            names.push(name.to_string());
+            names.push((name.to_string(), is_executable(&path)));
         }
     }
     names.sort();
     names
+}
+
+/// Whether any execute bit is set. `run-parts` skips non-executable
+/// files, so this is the closest thing cron has to "enabled".
+fn is_executable(path: &Path) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).ok()?.permissions().mode();
+        Some(mode & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
@@ -450,13 +489,55 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
     #[test]
     fn run_parts_constructs_tasks_with_implied_period() {
-        let scripts = ["logrotate", "mlocate"];
+        let scripts = [("logrotate", Some(true)), ("mlocate", Some(false))];
         let tasks = CronAdapter::parse_run_parts("daily", &scripts, "/etc/cron.daily");
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].id, "/etc/cron.daily/logrotate");
         assert!(matches!(tasks[0].schedule, ScheduleType::Calendar(ref s) if s == "@daily"));
         assert_eq!(tasks[0].command, "/etc/cron.daily/logrotate");
         assert_eq!(tasks[0].name, "logrotate");
+        assert_eq!(
+            tasks[0].location.as_deref(),
+            Some("/etc/cron.daily/logrotate")
+        );
+        assert_eq!(tasks[0].enabled, Some(true));
+        // A script without the executable bit is one run-parts skips.
+        assert_eq!(tasks[1].enabled, Some(false));
+    }
+
+    #[test]
+    fn run_parts_keeps_an_unknown_executable_bit_unknown() {
+        let tasks = CronAdapter::parse_run_parts("daily", &[("x", None)], "/etc/cron.daily");
+        assert_eq!(tasks[0].enabled, None);
+    }
+
+    #[test]
+    fn disabled_marker_line_parses_as_a_disabled_job_at_its_real_line() {
+        let text = "\
+# comment
+FOO=bar
+#shuvjobs-disabled# 0 2 * * * root /x
+* * * * * root /bin/true
+";
+        let tasks = CronAdapter::parse_crontab(text, "/etc/cron.d/app", true);
+        assert_eq!(tasks.len(), 2, "got {tasks:?}");
+        let disabled = &tasks[0];
+        assert_eq!(disabled.id, "/etc/cron.d/app:3");
+        assert_eq!(disabled.enabled, Some(false));
+        assert_eq!(disabled.command, "/x");
+        assert!(matches!(disabled.schedule, ScheduleType::Cron(ref s) if s == "0 2 * * *"));
+        assert_eq!(disabled.location.as_deref(), Some("/etc/cron.d/app"));
+
+        let live = &tasks[1];
+        assert_eq!(live.id, "/etc/cron.d/app:4");
+        assert_eq!(live.enabled, Some(true));
+    }
+
+    #[test]
+    fn per_user_crontab_has_no_location() {
+        let tasks = CronAdapter::parse_crontab(PER_USER_CRONTAB, "user:alice", false);
+        assert_eq!(tasks[0].location, None);
+        assert_eq!(tasks[0].enabled, Some(true));
     }
 
     #[test]
@@ -602,7 +683,7 @@ nobody:x:65534:65534:nobody:/nonexistent:/bin/false
 
     #[test]
     fn parse_run_parts_populates_next_run_for_period_alias() {
-        let scripts = ["logrotate"];
+        let scripts = [("logrotate", Some(true))];
         let tasks = CronAdapter::parse_run_parts("hourly", &scripts, "/etc/cron.hourly");
         assert!(tasks[0].next_run.is_some());
     }

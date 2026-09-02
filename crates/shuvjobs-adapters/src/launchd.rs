@@ -51,16 +51,25 @@ impl LaunchdAdapter {
     /// without a `Label` or without any of `StartInterval`/`StartCalendarInterval`
     /// (i.e. unscheduled jobs like `RunAtLoad`-only daemons).
     ///
-    /// `next_run` is resolved against the local wall clock; use
-    /// [`Self::parse_plist_at`] to supply the clock explicitly (remote hosts).
-    pub fn parse_plist(bytes: &[u8]) -> Result<Option<ScheduledTask>> {
-        Self::parse_plist_at(bytes, Local::now())
+    /// `path` is the plist's own location, reported as the task's
+    /// `location`. `next_run` is resolved against the local wall clock;
+    /// use [`Self::parse_plist_at`] to supply the clock explicitly
+    /// (remote hosts).
+    pub fn parse_plist(bytes: &[u8], path: &str) -> Result<Option<ScheduledTask>> {
+        Self::parse_plist_at(bytes, path, Local::now())
     }
 
     /// [`Self::parse_plist`] with an explicit "now", in the timezone the
     /// job's host interprets its schedule in.
+    ///
+    /// `enabled` is `Some(false)` when the plist carries `Disabled=true`
+    /// and `None` otherwise; the caller raises it to `Some(true)` for
+    /// labels that `launchctl list` reports as loaded. (`launchctl
+    /// print-disabled <domain>` would also settle the override database
+    /// case; it is not consulted yet.)
     pub fn parse_plist_at<Tz: TimeZone>(
         bytes: &[u8],
+        path: &str,
         now: DateTime<Tz>,
     ) -> Result<Option<ScheduledTask>> {
         let value: Value = plist::from_bytes(bytes).map_err(|e| Error::Parse {
@@ -78,6 +87,11 @@ impl LaunchdAdapter {
         else {
             return Ok(None);
         };
+
+        let disabled = dict
+            .get("Disabled")
+            .and_then(|v| v.as_boolean())
+            .unwrap_or(false);
 
         let command = match dict.get("ProgramArguments") {
             Some(Value::Array(arr)) => arr
@@ -118,8 +132,8 @@ impl LaunchdAdapter {
             last_duration: None,
             next_run,
             command,
-            location: None,
-            enabled: None,
+            location: Some(path.to_string()),
+            enabled: disabled.then_some(false),
         }))
     }
 }
@@ -176,9 +190,13 @@ impl TaskSource for LaunchdAdapter {
                         continue;
                     }
                     let Ok(bytes) = fs::read(&path) else { continue };
-                    match Self::parse_plist_at(&bytes, now) {
+                    let path_str = path.to_string_lossy().into_owned();
+                    match Self::parse_plist_at(&bytes, &path_str, now) {
                         Ok(Some(mut task)) => {
                             if let Some(rt) = runtime.get(&task.id) {
+                                // Loaded in launchd's domain, whatever
+                                // the plist's own `Disabled` key says.
+                                task.enabled = Some(true);
                                 task.last_status = rt.last_exit_status.map(|code| {
                                     if code == 0 {
                                         TaskStatus::Success
@@ -304,6 +322,8 @@ pub(crate) fn format_calendar_interval(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    const TEST_PLIST_PATH: &str = "/Library/LaunchAgents/com.example.heartbeat.plist";
+
     const LAUNCHCTL_LIST: &str = "PID\tStatus\tLabel\n\
                                    -\t0\tcom.apple.cloudphotosd\n\
                                    1234\t-\tcom.example.runner\n\
@@ -349,7 +369,7 @@ mod tests {
 
     #[test]
     fn parse_plist_extracts_interval() {
-        let task = LaunchdAdapter::parse_plist(INTERVAL_PLIST.as_bytes())
+        let task = LaunchdAdapter::parse_plist(INTERVAL_PLIST.as_bytes(), TEST_PLIST_PATH)
             .unwrap()
             .expect("interval plist should produce a task");
         assert_eq!(task.id, "com.example.heartbeat");
@@ -384,7 +404,7 @@ mod tests {
 
     #[test]
     fn parse_plist_extracts_calendar_interval() {
-        let task = LaunchdAdapter::parse_plist(CALENDAR_PLIST.as_bytes())
+        let task = LaunchdAdapter::parse_plist(CALENDAR_PLIST.as_bytes(), TEST_PLIST_PATH)
             .unwrap()
             .unwrap();
         assert_eq!(task.id, "com.example.morning");
@@ -412,8 +432,39 @@ mod tests {
 </plist>"#;
 
     #[test]
+    fn parse_plist_records_the_plist_path_as_the_location() {
+        let task = LaunchdAdapter::parse_plist(INTERVAL_PLIST.as_bytes(), TEST_PLIST_PATH)
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.location.as_deref(), Some(TEST_PLIST_PATH));
+        // Nothing in the plist says otherwise and `launchctl list` has
+        // not been consulted yet.
+        assert_eq!(task.enabled, None);
+    }
+
+    const DISABLED_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.example.heartbeat</string>
+    <key>ProgramArguments</key><array><string>/usr/local/bin/heartbeat</string></array>
+    <key>StartInterval</key><integer>900</integer>
+    <key>Disabled</key><true/>
+</dict>
+</plist>"#;
+
+    #[test]
+    fn parse_plist_reports_a_disabled_key_as_disabled() {
+        let task = LaunchdAdapter::parse_plist(DISABLED_PLIST.as_bytes(), TEST_PLIST_PATH)
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.enabled, Some(false));
+    }
+
+    #[test]
     fn parse_plist_skips_unscheduled_jobs() {
-        let parsed = LaunchdAdapter::parse_plist(RUN_AT_LOAD_PLIST.as_bytes()).unwrap();
+        let parsed =
+            LaunchdAdapter::parse_plist(RUN_AT_LOAD_PLIST.as_bytes(), TEST_PLIST_PATH).unwrap();
         assert!(parsed.is_none());
     }
 
@@ -448,9 +499,13 @@ mod tests {
     }
 
     fn parsed_at(body: &str) -> ScheduledTask {
-        LaunchdAdapter::parse_plist_at(calendar_plist(body).as_bytes(), now_west7())
-            .unwrap()
-            .expect("calendar plist should produce a task")
+        LaunchdAdapter::parse_plist_at(
+            calendar_plist(body).as_bytes(),
+            TEST_PLIST_PATH,
+            now_west7(),
+        )
+        .unwrap()
+        .expect("calendar plist should produce a task")
     }
 
     #[test]
@@ -528,9 +583,10 @@ mod tests {
 
     #[test]
     fn interval_jobs_have_no_next_run() {
-        let task = LaunchdAdapter::parse_plist_at(INTERVAL_PLIST.as_bytes(), now_west7())
-            .unwrap()
-            .unwrap();
+        let task =
+            LaunchdAdapter::parse_plist_at(INTERVAL_PLIST.as_bytes(), TEST_PLIST_PATH, now_west7())
+                .unwrap()
+                .unwrap();
         assert!(task.next_run.is_none());
     }
 
