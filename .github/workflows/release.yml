@@ -18,24 +18,27 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: sta-linux-x86_64
+            asset: shuvjobs-linux-x86_64
             use_cross: false
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            asset: sta-linux-aarch64
+            asset: shuvjobs-linux-aarch64
             use_cross: true
           - os: macos-latest
             target: x86_64-apple-darwin
-            asset: sta-macos-x86_64
+            asset: shuvjobs-macos-x86_64
             use_cross: false
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset: sta-macos-aarch64
+            asset: shuvjobs-macos-aarch64
             use_cross: false
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Check fork identity
+        run: scripts/check-identity.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -57,17 +60,17 @@ jobs:
 
       - name: Build (cargo)
         if: matrix.use_cross == false
-        run: cargo build --release --target ${{ matrix.target }} -p sta-cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p shuvjobs
 
       - name: Build (cross)
         if: matrix.use_cross == true
-        run: cross build --release --target ${{ matrix.target }} -p sta-cli
+        run: cross build --release --locked --target ${{ matrix.target }} -p shuvjobs
 
       - name: Stage binary
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/sta" "dist/${{ matrix.asset }}"
+          cp "target/${{ matrix.target }}/release/shuvjobs" "dist/${{ matrix.asset }}"
           chmod +x "dist/${{ matrix.asset }}"
 
       - name: Upload artifact

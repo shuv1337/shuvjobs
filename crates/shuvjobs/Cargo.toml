@@ -1,0 +1,23 @@
+[package]
+name = "shuvjobs"
+version.workspace = true
+edition.workspace = true
+license-file = "../../LICENSE"
+repository.workspace = true
+rust-version.workspace = true
+description = "Unified terminal interface for scheduled jobs across host schedulers"
+readme = "../../README.md"
+keywords = ["cron", "systemd", "scheduler", "tui"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "shuvjobs"
+path = "src/main.rs"
+
+[dependencies]
+shuvjobs-core = { workspace = true }
+shuvjobs-adapters = { workspace = true }
+shuvjobs-tui = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }

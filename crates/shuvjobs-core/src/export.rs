@@ -2,7 +2,7 @@
 //!
 //! `ScheduledTask`'s default serde derive emits Rust-shaped tags
 //! (`{"Cron": "..."}`) and a struct-y `Duration`. `ExportTask` is the
-//! flat shape we hand to `sta --json` consumers and the SSH bridge.
+//! flat shape we hand to `shuvjobs --json` consumers and the SSH bridge.
 //! Round-trips losslessly.
 
 use std::time::Duration;

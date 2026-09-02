@@ -1,4 +1,4 @@
-//! Binary entry point. The only place `sta-adapters` and `sta-tui` meet.
+//! Binary entry point. The only place `shuvjobs-adapters` and `shuvjobs-tui` meet.
 
 mod remote;
 
@@ -6,9 +6,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sta_adapters::{AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter};
-use sta_core::{export, Error, ScheduledTask, TaskSource};
-use sta_tui::RunOptions;
+use shuvjobs_adapters::{AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter};
+use shuvjobs_core::{export, Error, ScheduledTask, TaskSource};
+use shuvjobs_tui::RunOptions;
 
 use crate::remote::RemoteCollector;
 
@@ -16,8 +16,8 @@ type RefreshFn = Box<dyn FnMut() -> Result<Vec<ScheduledTask>>>;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "sta",
-    about = "Scheduled Task Auditor — view every cron, systemd timer, at, anacron, and launchd job in one table",
+    name = "shuvjobs",
+    about = "ShuvJobs — inspect cron, systemd timer, at, anacron, and launchd jobs in one table",
     version
 )]
 struct Cli {
@@ -26,7 +26,7 @@ struct Cli {
     json: bool,
 
     /// Collect from a remote host over SSH (e.g. `alice@server.example.com`).
-    /// Key auth must be set up — sta runs ssh in BatchMode and never prompts.
+    /// Key auth must be set up — shuvjobs runs ssh in BatchMode and never prompts.
     #[arg(long, value_name = "USER@HOST")]
     host: Option<String>,
 
@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     }
 
     let (initial, refresh) = collect_with_refresh(&cli)?;
-    sta_tui::run(RunOptions {
+    shuvjobs_tui::run(RunOptions {
         initial,
         refresh: Some(refresh),
         refresh_secs: cli.refresh,

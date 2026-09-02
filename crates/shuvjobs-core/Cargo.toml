@@ -1,10 +1,11 @@
 [package]
-name = "sta-core"
+name = "shuvjobs-core"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file = "../../LICENSE"
 repository.workspace = true
 rust-version.workspace = true
+description = "Domain model and query operations for ShuvJobs"
 
 [dependencies]
 chrono = { workspace = true }

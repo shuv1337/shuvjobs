@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
-use sta_core::{
+use shuvjobs_core::{
     Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind, TaskStatus,
 };
 
@@ -341,7 +341,7 @@ mod tests {
     }
 
     /// Regression: newer `systemctl list-timers --output=json` returns
-    /// JSON `null` (not `0`) for unset elapse times. Older sta versions
+    /// JSON `null` (not `0`) for unset elapse times. Older shuvjobs versions
     /// declared the field as `i64` and panicked at deserialization.
     #[test]
     fn parse_list_timers_handles_null_next_and_last() {

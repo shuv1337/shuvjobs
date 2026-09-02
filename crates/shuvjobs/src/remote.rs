@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{Datelike, FixedOffset, TimeZone, Utc};
-use sta_adapters::{
+use shuvjobs_adapters::{
     launchd::LaunchctlEntry, AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter,
 };
-use sta_core::{ScheduleType, ScheduledTask, TaskStatus};
+use shuvjobs_core::{ScheduleType, ScheduledTask, TaskStatus};
 
 /// Cap below sshd's default `MaxSessions` (10) so we never get refused
 /// channels on the remote side, even on the worst case of many small
@@ -32,7 +32,7 @@ pub struct RemoteCollector {
     pub host: String,
     pub port: Option<u16>,
     pub key_path: Option<PathBuf>,
-    /// SSH multiplex control socket. Per-process so concurrent `sta`
+    /// SSH multiplex control socket. Per-process so concurrent `shuvjobs`
     /// invocations against the same host don't collide.
     control_path: PathBuf,
 }
@@ -70,7 +70,7 @@ impl std::fmt::Display for RemoteCmdError {
 /// Same Unavailable / hard-error split that local adapters use, but for
 /// remote sources. The orchestrator in [`RemoteCollector::collect`] maps
 /// `Unavailable` to "skip silently" and `Other` to a stderr warning,
-/// matching `sta-cli`'s local-mode behavior.
+/// matching `shuvjobs`'s local-mode behavior.
 #[derive(Debug)]
 enum RemoteSourceError {
     Unavailable,
@@ -80,7 +80,8 @@ enum RemoteSourceError {
 
 impl RemoteCollector {
     pub fn new(host: String, port: Option<u16>, key_path: Option<PathBuf>) -> Self {
-        let control_path = std::env::temp_dir().join(format!("sta-ssh-{}", std::process::id()));
+        let control_path =
+            std::env::temp_dir().join(format!("shuvjobs-ssh-{}", std::process::id()));
         Self {
             host,
             port,
@@ -757,7 +758,7 @@ fn map_systemd_result(s: String) -> TaskStatus {
     }
 }
 
-// Mirror of the private helper in `sta-adapters::anacron`.
+// Mirror of the private helper in `shuvjobs-adapters::anacron`.
 fn anacron_period_advance(schedule: &ScheduleType) -> Option<chrono::Duration> {
     match schedule {
         ScheduleType::Interval(d) => chrono::Duration::from_std(*d).ok(),
@@ -874,7 +875,7 @@ mod tests {
             host: "alice@host".into(),
             port: None,
             key_path: None,
-            control_path: PathBuf::from("/tmp/sta-ssh-1"),
+            control_path: PathBuf::from("/tmp/shuvjobs-ssh-1"),
         }
     }
 
@@ -891,7 +892,7 @@ mod tests {
                 "-o",
                 "ControlMaster=auto",
                 "-o",
-                "ControlPath=/tmp/sta-ssh-1",
+                "ControlPath=/tmp/shuvjobs-ssh-1",
                 "-o",
                 "ControlPersist=60",
                 "alice@host",
@@ -907,7 +908,7 @@ mod tests {
             host: "alice@host".into(),
             port: Some(2222),
             key_path: Some(PathBuf::from("/k")),
-            control_path: PathBuf::from("/tmp/sta-ssh-1"),
+            control_path: PathBuf::from("/tmp/shuvjobs-ssh-1"),
         };
         let argv = coll.ssh_argv("ls");
         // ssh doesn't care about flag order; assert by adjacency.
@@ -1247,7 +1248,7 @@ mod tests {
         ScheduledTask {
             id: "logrotate.timer".into(),
             name: "logrotate".into(),
-            source: sta_core::TaskSourceKind::Systemd,
+            source: shuvjobs_core::TaskSourceKind::Systemd,
             schedule: ScheduleType::Calendar(String::new()),
             last_run: None,
             last_status: None,
@@ -1291,7 +1292,7 @@ mod tests {
         ScheduledTask {
             id: "com.example.heartbeat".into(),
             name: "com.example.heartbeat".into(),
-            source: sta_core::TaskSourceKind::Launchd,
+            source: shuvjobs_core::TaskSourceKind::Launchd,
             schedule: ScheduleType::Interval(std::time::Duration::from_secs(900)),
             last_run: None,
             last_status: None,

@@ -1,13 +1,14 @@
 [package]
-name = "sta-tui"
+name = "shuvjobs-tui"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file = "../../LICENSE"
 repository.workspace = true
 rust-version.workspace = true
+description = "Terminal interface for ShuvJobs"
 
 [dependencies]
-sta-core = { workspace = true }
+shuvjobs-core = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 anyhow = { workspace = true }

@@ -10,25 +10,29 @@ new GitHub Release.
 
 ## Cutting a release
 
-1. Bump the version in every workspace `Cargo.toml` and commit:
+1. Update `workspace.package.version` and the three internal dependency
+   versions in the root `Cargo.toml`, then verify and commit:
 
    ```sh
-   git commit -am "Release v1.2.0"
+   cargo test --workspace --locked
+   cargo package --workspace --locked --no-verify
+   jj commit -m "release: v1.2.0"
    ```
 
-2. Tag and push:
+2. Point `main` and the release tag at the release commit, then push them:
 
    ```sh
-   git tag v1.2.0
-   git push origin main
+   jj bookmark set main -r @-
+   jj tag set v1.2.0 -r @-
+   jj git push --bookmark main
    git push origin v1.2.0
    ```
 
 The workflow takes a few minutes. When it finishes, the release
-appears under [Releases](https://github.com/aligoren/sta/releases)
+appears under [Releases](https://github.com/shuv1337/shuvjobs/releases)
 with these assets:
 
-- `sta-linux-x86_64`
-- `sta-linux-aarch64`
-- `sta-macos-x86_64`
-- `sta-macos-aarch64`
+- `shuvjobs-linux-x86_64`
+- `shuvjobs-linux-aarch64`
+- `shuvjobs-macos-x86_64`
+- `shuvjobs-macos-aarch64`

@@ -1,24 +1,22 @@
-# sta
+# ShuvJobs
 
-Scheduled Task Auditor — a unified terminal UI for inspecting every
+ShuvJobs is a unified terminal interface for inspecting every
 scheduled task on a Linux or macOS host: cron, systemd timers, `at`,
 anacron, and launchd.
 
 ## Screenshots
 
-<!-- Replace these placeholders with real screenshots before publishing. -->
-
 ### Main View
 
-![sta main view](docs/screenshots/main.png)
+![ShuvJobs main view](docs/screenshots/main.png)
 
 ### Detail Pane
 
-![sta detail pane](docs/screenshots/detail.png)
+![ShuvJobs detail pane](docs/screenshots/detail.png)
 
 ### Filter Mode
 
-![sta filter mode](docs/screenshots/filter.png)
+![ShuvJobs filter mode](docs/screenshots/filter.png)
 
 ## Why
 
@@ -31,7 +29,7 @@ run" and "last result". Auditing what's actually scheduled to fire on
 a host means running four or five commands, parsing their output by
 hand, and reconciling the differences.
 
-`sta` collapses all of that into a single sortable, filterable table.
+`shuvjobs` collapses all of that into a single sortable, filterable table.
 
 ## Features
 
@@ -45,14 +43,16 @@ hand, and reconciling the differences.
 - JSON export for scripting and pipelines
 - Soft-skip for unavailable subsystems (systemd on macOS, launchd on Linux, etc.)
 
+ShuvJobs is currently read-only. Full create, update, and delete management
+across every supported scheduler is the fork's next product milestone.
+
 ## Installation
 
 ```sh
-cargo install sta
+cargo install --git https://github.com/shuv1337/shuvjobs shuvjobs
 ```
 
-AUR and Homebrew packages are planned and will be linked here once
-published.
+Crates.io, AUR, and Homebrew packages are planned.
 
 ## Usage
 
@@ -61,33 +61,33 @@ published.
 Run with no arguments to inspect the current host:
 
 ```sh
-sta
+shuvjobs
 ```
 
 ### Remote host over SSH
 
-`sta` does not ship a binary to the remote machine. It opens an SSH
+`shuvjobs` does not ship a binary to the remote machine. It opens an SSH
 connection, runs the same commands an operator would type by hand
 (`systemctl`, `crontab -l`, `atq`, `cat /etc/anacrontab`, and so on),
 and parses the output locally.
 
 ```sh
-sta --host user@hostname
+shuvjobs --host user@hostname
 ```
 
-SSH key authentication must already be set up — `sta` runs in
+SSH key authentication must already be set up — `shuvjobs` runs in
 `BatchMode=yes` and never prompts for a password.
 
 #### Custom SSH port
 
 ```sh
-sta --host user@hostname --port 2222
+shuvjobs --host user@hostname --port 2222
 ```
 
 #### Custom SSH key
 
 ```sh
-sta --host user@hostname --key ~/.ssh/id_ed25519
+shuvjobs --host user@hostname --key ~/.ssh/id_ed25519
 ```
 
 ### JSON export
@@ -95,14 +95,14 @@ sta --host user@hostname --key ~/.ssh/id_ed25519
 Print every collected task as a JSON array and exit:
 
 ```sh
-sta --json
+shuvjobs --json
 ```
 
 Works in both local and remote mode and is intended for piping into
 other tools:
 
 ```sh
-sta --host user@hostname --json | jq '.[] | select(.source == "systemd")'
+shuvjobs --host user@hostname --json | jq '.[] | select(.source == "systemd")'
 ```
 
 ### Auto-refresh
@@ -110,13 +110,13 @@ sta --host user@hostname --json | jq '.[] | select(.source == "systemd")'
 Re-collect and redraw every N seconds:
 
 ```sh
-sta --refresh 30
+shuvjobs --refresh 30
 ```
 
 Combine with remote mode for continuous monitoring of a server:
 
 ```sh
-sta --host user@hostname --refresh 60
+shuvjobs --host user@hostname --refresh 60
 ```
 
 ## Keyboard shortcuts
@@ -159,9 +159,10 @@ Pull requests are welcome. Before submitting:
 1. Run `cargo test` and make sure everything passes.
 2. Run `cargo clippy --workspace --all-targets` and address any
    warnings.
-3. If you are touching a parser, add a fixture test. Real captured
+3. Run `scripts/check-identity.sh`.
+4. If you are touching a parser, add a fixture test. Real captured
    command output beats idealized examples — see the existing
-   fixtures in `crates/sta-adapters/src/*.rs` for the convention.
+   fixtures in `crates/shuvjobs-adapters/src/*.rs` for the convention.
 
 For larger changes please open an issue first to discuss the
 approach.

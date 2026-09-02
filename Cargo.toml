@@ -1,30 +1,30 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/sta-core",
-    "crates/sta-adapters",
-    "crates/sta-tui",
-    "crates/sta-cli",
+    "crates/shuvjobs-core",
+    "crates/shuvjobs-adapters",
+    "crates/shuvjobs-tui",
+    "crates/shuvjobs",
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/ali/sta"
-rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/shuv1337/shuvjobs"
+rust-version = "1.88"
 
 [workspace.dependencies]
-sta-core = { path = "crates/sta-core" }
-sta-adapters = { path = "crates/sta-adapters" }
-sta-tui = { path = "crates/sta-tui" }
+shuvjobs-core = { version = "0.2.0", path = "crates/shuvjobs-core" }
+shuvjobs-adapters = { version = "0.2.0", path = "crates/shuvjobs-adapters" }
+shuvjobs-tui = { version = "0.2.0", path = "crates/shuvjobs-tui" }
 
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
-anyhow = "1"
+anyhow = "1.0.103"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ratatui = "0.28"
-crossterm = "0.28"
-plist = "1"
+ratatui = "0.30"
+crossterm = "0.29"
+plist = "1.10"
 clap = { version = "4", features = ["derive"] }

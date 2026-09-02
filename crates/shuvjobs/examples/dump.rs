@@ -1,8 +1,8 @@
 //! Per-adapter collection summary. Handy for sanity-checking the
 //! pipeline against a live system without bringing up the TUI.
 
-use sta_adapters::{AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter};
-use sta_core::{Error, TaskSource};
+use shuvjobs_adapters::{AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter};
+use shuvjobs_core::{Error, TaskSource};
 
 fn main() {
     let sources: Vec<Box<dyn TaskSource>> = vec![

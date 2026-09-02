@@ -6,7 +6,7 @@
 use std::process::Command;
 
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
-use sta_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
+use shuvjobs_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
 
 #[derive(Debug, Default)]
 pub struct AtAdapter;

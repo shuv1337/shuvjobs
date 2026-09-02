@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use sta_core::{ScheduleType, ScheduledTask, TaskSourceKind, TaskStatus};
+use shuvjobs_core::{ScheduleType, ScheduledTask, TaskSourceKind, TaskStatus};
 use std::time::Duration;
 
 #[test]

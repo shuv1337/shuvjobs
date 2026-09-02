@@ -1,6 +1,6 @@
 //! Filter, sort, and search operations over `ScheduledTask` slices.
 //!
-//! Pure functions — `sta-tui` composes them to drive its display state.
+//! Pure functions — `shuvjobs-tui` composes them to drive its display state.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;

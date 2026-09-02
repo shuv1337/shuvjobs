@@ -1,4 +1,4 @@
-//! Domain types for sta. OS-agnostic by design.
+//! Domain types for shuvjobs. OS-agnostic by design.
 
 mod error;
 pub mod export;

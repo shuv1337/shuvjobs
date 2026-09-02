@@ -1,5 +1,5 @@
-//! ratatui frontend for sta. Depends only on `sta-core` — filter/sort/search
-//! logic lives there in `sta_core::view`; this crate is just the keyboard
+//! ratatui frontend for shuvjobs. Depends only on `shuvjobs-core` — filter/sort/search
+//! logic lives there in `shuvjobs_core::view`; this crate is just the keyboard
 //! and render layer.
 
 use std::collections::HashSet;
@@ -16,12 +16,12 @@ use crossterm::{
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style, Stylize},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
     Frame, Terminal,
 };
-use sta_core::{
+use shuvjobs_core::{
     view::{apply, Filter, SortMode},
     ScheduleType, ScheduledTask, TaskSourceKind, TaskStatus,
 };
@@ -232,7 +232,10 @@ impl App {
     }
 
     /// Re-collect when the auto-refresh interval has elapsed.
-    fn maybe_refresh(&mut self, terminal: &mut Terminal<impl Backend>) -> Result<bool> {
+    fn maybe_refresh<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<bool>
+    where
+        B::Error: Send + Sync + 'static,
+    {
         let Some(secs) = self.refresh_secs else {
             return Ok(false);
         };
@@ -255,7 +258,7 @@ impl App {
         let detail_open = self.detail_open;
         let refreshing = self.refreshing;
         let available_sources = self.available_sources.clone();
-        let table_state = self.table_state.clone();
+        let table_state = self.table_state;
         let now = Utc::now();
         terminal.draw(|frame| {
             draw_with(
@@ -314,7 +317,10 @@ fn available_sources_of(tasks: &[ScheduledTask]) -> Vec<TaskSourceKind> {
     order.iter().filter(|k| seen.contains(k)).copied().collect()
 }
 
-fn event_loop<B: Backend>(terminal: &mut Terminal<B>, opts: RunOptions) -> Result<()> {
+fn event_loop<B: Backend>(terminal: &mut Terminal<B>, opts: RunOptions) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     let mut app = App::new(opts);
 
     while !app.quit {
@@ -346,7 +352,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, opts: RunOptions) -> Resul
 fn draw_app(frame: &mut Frame, app: &mut App, now: DateTime<Utc>) {
     // Pull table_state out by clone — render_stateful_widget needs it
     // mutably while the row builders below borrow other app fields.
-    let mut table_state = app.table_state.clone();
+    let mut table_state = app.table_state;
     draw_with(
         frame,
         &app.all,
@@ -423,7 +429,7 @@ fn draw_with(
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, total: usize, shown: usize, refreshing: bool) {
-    let mut text = format!(" sta — {shown}/{total} task(s) ");
+    let mut text = format!(" ShuvJobs — {shown}/{total} task(s) ");
     if refreshing {
         text.push_str(" · refreshing… ");
     }
@@ -500,7 +506,7 @@ fn draw_table(
     let table = Table::new(rows, widths)
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(" tasks "))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(table, area, table_state);
@@ -705,11 +711,11 @@ fn format_relative(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
 
 fn human_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
-    if secs % 86_400 == 0 && secs >= 86_400 {
+    if secs.is_multiple_of(86_400) && secs >= 86_400 {
         format!("{}d", secs / 86_400)
-    } else if secs % 3_600 == 0 && secs >= 3_600 {
+    } else if secs.is_multiple_of(3_600) && secs >= 3_600 {
         format!("{}h", secs / 3_600)
-    } else if secs % 60 == 0 && secs >= 60 {
+    } else if secs.is_multiple_of(60) && secs >= 60 {
         format!("{}m", secs / 60)
     } else {
         format!("{}s", secs)
