@@ -32,4 +32,8 @@
 - Render absolute timestamps in the TUI (detail pane last/next run, one-shot
   schedules, and the far-future date fallback) in the local timezone with the
   offset shown, instead of UTC.
+- Compute the next run time for launchd jobs that use
+  `StartCalendarInterval`, including arrays of intervals (earliest wins) and
+  both Sunday spellings of `Weekday`. `StartInterval` jobs still show no next
+  run, because launchd does not expose the load time the interval counts from.
 - Verify the declared minimum Rust version in CI.

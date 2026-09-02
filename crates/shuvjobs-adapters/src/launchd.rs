@@ -7,10 +7,13 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Local, TimeZone, Utc};
 use plist::Value;
 #[cfg(target_os = "macos")]
 use shuvjobs_core::TaskStatus;
 use shuvjobs_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
+
+use crate::cron::compute_next_run;
 
 #[derive(Debug, Default)]
 pub struct LaunchdAdapter;
@@ -47,7 +50,19 @@ impl LaunchdAdapter {
     /// Parse a launchd plist (XML or binary). Returns `None` for plists
     /// without a `Label` or without any of `StartInterval`/`StartCalendarInterval`
     /// (i.e. unscheduled jobs like `RunAtLoad`-only daemons).
+    ///
+    /// `next_run` is resolved against the local wall clock; use
+    /// [`Self::parse_plist_at`] to supply the clock explicitly (remote hosts).
     pub fn parse_plist(bytes: &[u8]) -> Result<Option<ScheduledTask>> {
+        Self::parse_plist_at(bytes, Local::now())
+    }
+
+    /// [`Self::parse_plist`] with an explicit "now", in the timezone the
+    /// job's host interprets its schedule in.
+    pub fn parse_plist_at<Tz: TimeZone>(
+        bytes: &[u8],
+        now: DateTime<Tz>,
+    ) -> Result<Option<ScheduledTask>> {
         let value: Value = plist::from_bytes(bytes).map_err(|e| Error::Parse {
             kind: "launchd plist".into(),
             message: e.to_string(),
@@ -77,13 +92,18 @@ impl LaunchdAdapter {
                 .to_string(),
         };
 
-        let schedule = if let Some(secs) = dict
+        // `StartInterval` jobs fire `n` seconds after the job was loaded,
+        // and launchd does not publish that load time anywhere the plist
+        // (or `launchctl list`) can see, so the next fire is unknowable
+        // from static inspection. `next_run` stays `None` on purpose.
+        let (schedule, next_run) = if let Some(secs) = dict
             .get("StartInterval")
             .and_then(|v| v.as_unsigned_integer())
         {
-            ScheduleType::Interval(Duration::from_secs(secs))
+            (ScheduleType::Interval(Duration::from_secs(secs)), None)
         } else if let Some(cal) = dict.get("StartCalendarInterval") {
-            ScheduleType::Calendar(format_calendar_interval(cal))
+            let next = next_calendar_run(cal, now);
+            (ScheduleType::Calendar(format_calendar_interval(cal)), next)
         } else {
             return Ok(None);
         };
@@ -96,7 +116,7 @@ impl LaunchdAdapter {
             last_run: None,
             last_status: None,
             last_duration: None,
-            next_run: None,
+            next_run,
             command,
         }))
     }
@@ -142,6 +162,7 @@ impl TaskSource for LaunchdAdapter {
                 dirs.push(PathBuf::from(home).join("Library/LaunchAgents"));
             }
 
+            let now = Local::now();
             let mut tasks = Vec::new();
             for dir in dirs {
                 let Ok(entries) = fs::read_dir(&dir) else {
@@ -153,7 +174,7 @@ impl TaskSource for LaunchdAdapter {
                         continue;
                     }
                     let Ok(bytes) = fs::read(&path) else { continue };
-                    match Self::parse_plist(&bytes) {
+                    match Self::parse_plist_at(&bytes, now) {
                         Ok(Some(mut task)) => {
                             if let Some(rt) = runtime.get(&task.id) {
                                 task.last_status = rt.last_exit_status.map(|code| {
@@ -201,6 +222,54 @@ fn parse_dash_int(s: &str) -> Option<i64> {
     } else {
         s.parse().ok()
     }
+}
+
+/// Convert one `StartCalendarInterval` dict into a 5-field cron
+/// expression (`minute hour day-of-month month day-of-week`). A key that
+/// launchd omits means "every value", i.e. `*`. launchd accepts both `0`
+/// and `7` for Sunday; croner wants a single canonical value, so `7` is
+/// folded to `0`. Returns `None` when a present key is not an integer;
+/// out-of-range numbers are left for the cron parser to reject.
+fn calendar_dict_to_cron(d: &plist::Dictionary) -> Option<String> {
+    let field = |key: &str| -> Option<String> {
+        match d.get(key) {
+            None => Some("*".to_string()),
+            Some(v) => {
+                let n = v.as_signed_integer()?;
+                let n = if key == "Weekday" && n == 7 { 0 } else { n };
+                Some(n.to_string())
+            }
+        }
+    };
+    Some(format!(
+        "{} {} {} {} {}",
+        field("Minute")?,
+        field("Hour")?,
+        field("Day")?,
+        field("Month")?,
+        field("Weekday")?
+    ))
+}
+
+/// Earliest next occurrence after `now` across every dict in a
+/// `StartCalendarInterval` (launchd allows a single dict or an array of
+/// them, and fires on the union). `None` when nothing parses — an
+/// out-of-range or malformed entry drops silently rather than panicking.
+///
+/// launchd's own semantics when both `Day` and `Weekday` are set match
+/// Vixie cron's OR of day-of-month and day-of-week, which is what
+/// [`compute_next_run`] gives us.
+fn next_calendar_run<Tz: TimeZone>(value: &Value, now: DateTime<Tz>) -> Option<DateTime<Utc>> {
+    let dicts: Vec<&plist::Dictionary> = match value {
+        Value::Dictionary(d) => vec![d],
+        Value::Array(arr) => arr.iter().filter_map(|v| v.as_dictionary()).collect(),
+        _ => return None,
+    };
+    dicts
+        .into_iter()
+        .filter_map(calendar_dict_to_cron)
+        .filter_map(|expr| compute_next_run(&ScheduleType::Cron(expr), now.clone()))
+        .min()
 }
 
 /// Render a `StartCalendarInterval` (dict or array of dicts) as
@@ -349,6 +418,118 @@ mod tests {
     #[test]
     fn adapter_reports_launchd_kind() {
         assert_eq!(LaunchdAdapter::new().kind(), TaskSourceKind::Launchd);
+    }
+
+    // ---- StartCalendarInterval next_run ----
+
+    /// Fixed local "now": 2026-04-14 01:30:00 -07:00 (a Tuesday).
+    fn now_west7() -> DateTime<chrono::FixedOffset> {
+        chrono::FixedOffset::west_opt(7 * 60 * 60)
+            .unwrap()
+            .with_ymd_and_hms(2026, 4, 14, 1, 30, 0)
+            .unwrap()
+    }
+
+    fn calendar_plist(body: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.example.job</string>
+    <key>ProgramArguments</key><array><string>/bin/true</string></array>
+    <key>StartCalendarInterval</key>
+{body}
+</dict>
+</plist>"#
+        )
+    }
+
+    fn parsed_at(body: &str) -> ScheduledTask {
+        LaunchdAdapter::parse_plist_at(calendar_plist(body).as_bytes(), now_west7())
+            .unwrap()
+            .expect("calendar plist should produce a task")
+    }
+
+    #[test]
+    fn calendar_hour_and_minute_next_run_is_today_in_local_time() {
+        let task = parsed_at(
+            "    <dict>\n        <key>Hour</key><integer>9</integer>\n\
+             \x20       <key>Minute</key><integer>30</integer>\n    </dict>",
+        );
+        assert_eq!(
+            task.next_run,
+            Some(Utc.with_ymd_and_hms(2026, 4, 14, 16, 30, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn calendar_weekday_zero_and_seven_both_mean_sunday() {
+        let zero = parsed_at(
+            "    <dict>\n        <key>Weekday</key><integer>0</integer>\n\
+             \x20       <key>Hour</key><integer>3</integer>\n\
+             \x20       <key>Minute</key><integer>0</integer>\n    </dict>",
+        );
+        let seven = parsed_at(
+            "    <dict>\n        <key>Weekday</key><integer>7</integer>\n\
+             \x20       <key>Hour</key><integer>3</integer>\n\
+             \x20       <key>Minute</key><integer>0</integer>\n    </dict>",
+        );
+        // 2026-04-14 is a Tuesday; the next Sunday 03:00 -07:00 is
+        // 2026-04-19 03:00 -07:00 == 2026-04-19 10:00 UTC.
+        assert_eq!(
+            zero.next_run,
+            Some(Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap())
+        );
+        assert_eq!(zero.next_run, seven.next_run);
+        // The rendered schedule text still reports launchd's own value.
+        assert!(matches!(seven.schedule, ScheduleType::Calendar(ref s) if s.contains("Weekday=7")));
+    }
+
+    #[test]
+    fn calendar_array_picks_the_earliest_occurrence() {
+        let task = parsed_at(
+            "    <array>\n\
+             \x20       <dict><key>Hour</key><integer>23</integer>\
+             <key>Minute</key><integer>0</integer></dict>\n\
+             \x20       <dict><key>Hour</key><integer>6</integer>\
+             <key>Minute</key><integer>15</integer></dict>\n\
+             \x20   </array>",
+        );
+        // 06:15 -07:00 today beats 23:00 -07:00 today.
+        assert_eq!(
+            task.next_run,
+            Some(Utc.with_ymd_and_hms(2026, 4, 14, 13, 15, 0).unwrap())
+        );
+        // Rendering of an array is unchanged: dicts joined by " | ".
+        assert!(matches!(task.schedule, ScheduleType::Calendar(ref s) if s.contains(" | ")));
+    }
+
+    #[test]
+    fn calendar_minute_only_runs_every_hour() {
+        let task = parsed_at("    <dict><key>Minute</key><integer>45</integer></dict>");
+        assert_eq!(
+            task.next_run,
+            Some(Utc.with_ymd_and_hms(2026, 4, 14, 8, 45, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn calendar_out_of_range_value_yields_no_next_run() {
+        let task = parsed_at(
+            "    <dict><key>Hour</key><integer>99</integer>\
+             <key>Minute</key><integer>0</integer></dict>",
+        );
+        assert!(task.next_run.is_none());
+        assert!(matches!(task.schedule, ScheduleType::Calendar(_)));
+    }
+
+    #[test]
+    fn interval_jobs_have_no_next_run() {
+        let task = LaunchdAdapter::parse_plist_at(INTERVAL_PLIST.as_bytes(), now_west7())
+            .unwrap()
+            .unwrap();
+        assert!(task.next_run.is_none());
     }
 
     #[cfg(not(target_os = "macos"))]

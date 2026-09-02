@@ -13,7 +13,7 @@ use std::process::Command;
 use std::thread;
 
 use anyhow::{anyhow, bail, Result};
-use chrono::{Datelike, FixedOffset, TimeZone, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, TimeZone, Utc};
 use shuvjobs_adapters::{
     anacron::period_advance as anacron_period_advance,
     cron::crontab_list_args,
@@ -170,7 +170,7 @@ impl RemoteCollector {
 
         let systemd_result = self.collect_systemd_parallel();
         let cron_result = self.collect_cron_parallel(remote_offset);
-        let launchd_result = self.collect_launchd_parallel();
+        let launchd_result = self.collect_launchd_parallel(remote_offset);
 
         let mut runner = |cmd: &str| self.run_command(cmd);
         let at_result = collect_at_via(&mut runner, &remote_offset);
@@ -366,7 +366,9 @@ impl RemoteCollector {
 
     fn collect_launchd_parallel(
         &self,
+        remote_offset: FixedOffset,
     ) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError> {
+        let now = Utc::now().with_timezone(&remote_offset);
         if optional_remote_output(self.run_command("command -v launchctl >/dev/null 2>&1"))?
             .is_none()
         {
@@ -410,7 +412,7 @@ impl RemoteCollector {
             let Some(content) = content_opt? else {
                 continue;
             };
-            match LaunchdAdapter::parse_plist(content.as_bytes()) {
+            match LaunchdAdapter::parse_plist_at(content.as_bytes(), now) {
                 Ok(Some(mut task)) => {
                     let rt_entry = runtime.get(&task.id);
                     apply_launchctl_runtime(&mut task, rt_entry);
@@ -717,7 +719,10 @@ where
 }
 
 #[allow(dead_code)]
-fn collect_launchd_via<F>(run: &mut F) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError>
+fn collect_launchd_via<F>(
+    run: &mut F,
+    now: DateTime<FixedOffset>,
+) -> std::result::Result<Vec<ScheduledTask>, RemoteSourceError>
 where
     F: FnMut(&str) -> std::result::Result<String, RemoteCmdError>,
 {
@@ -745,7 +750,7 @@ where
     for path in plist_paths.lines().map(str::trim).filter(|s| !s.is_empty()) {
         let cmd = format!("cat {} 2>/dev/null", shell_quote(path));
         let Ok(content) = run(&cmd) else { continue };
-        match LaunchdAdapter::parse_plist(content.as_bytes()) {
+        match LaunchdAdapter::parse_plist_at(content.as_bytes(), now) {
             Ok(Some(mut task)) => {
                 if let Some(rt) = runtime.get(&task.id) {
                     task.last_status = rt.last_exit_status.map(|code| {
@@ -954,6 +959,15 @@ mod tests {
     /// Build a runner that looks up commands in a fixed map. Unknown
     /// commands fall through to `Failed{1}`, which the collectors treat
     /// as "this slice of the source isn't present".
+    /// Fixed "now" in a non-UTC offset, standing in for the remote host's
+    /// wall clock in the tests that exercise the launchd bridge.
+    fn remote_now() -> DateTime<FixedOffset> {
+        FixedOffset::west_opt(7 * 60 * 60)
+            .unwrap()
+            .with_ymd_and_hms(2026, 4, 14, 1, 30, 0)
+            .unwrap()
+    }
+
     fn router(
         fixtures: HashMap<&'static str, &'static str>,
     ) -> impl FnMut(&str) -> std::result::Result<String, RemoteCmdError> {
@@ -1195,7 +1209,7 @@ ExecMainExitTimestampMonotonic=40202376368
             PLIST_BODY,
         );
         let mut run = router(fx);
-        let tasks = collect_launchd_via(&mut run).unwrap();
+        let tasks = collect_launchd_via(&mut run, remote_now()).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "com.example.heartbeat");
         // launchctl reported exit 0 → Success
@@ -1211,7 +1225,7 @@ ExecMainExitTimestampMonotonic=40202376368
         let mut run = |_cmd: &str| -> std::result::Result<String, RemoteCmdError> {
             Err(RemoteCmdError::NotFound)
         };
-        let err = collect_launchd_via(&mut run).unwrap_err();
+        let err = collect_launchd_via(&mut run, remote_now()).unwrap_err();
         assert!(matches!(err, RemoteSourceError::Unavailable));
     }
 
