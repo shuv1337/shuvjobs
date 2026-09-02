@@ -5,17 +5,17 @@ mod ops;
 mod remote;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use shuvjobs_core::export::{self, ExportTask};
 use shuvjobs_core::manage::MutationOutcome;
 use shuvjobs_core::{Op, ScheduledTask, TaskSourceKind};
-use shuvjobs_tui::RunOptions;
+use shuvjobs_tui::{MutateFn, RunOptions, Stage};
 
 use crate::cli::{Cli, Command, EditArgs, Global, IdArgs};
 use crate::ops::{CliError, ErrorReport, Report, Session};
-use crate::remote::RemoteCollector;
 
 /// `Send`: the TUI runs collection on a background worker thread.
 type RefreshFn = Box<dyn FnMut() -> Result<Vec<ScheduledTask>> + Send>;
@@ -256,30 +256,33 @@ fn report_error(err: &anyhow::Error, json: bool, context: &OpContext) {
     }
 }
 
+/// The TUI shares one [`Session`] with its worker thread: the same host,
+/// the same writers, and over SSH the same multiplex master, so opening
+/// the form does not start a second connection.
 fn run_tui(global: &Global, refresh_secs: Option<u64>) -> Result<()> {
-    let (initial, refresh) = collect_with_refresh(global)?;
+    let session = Arc::new(Session::open(global)?);
+    let initial = session.collect()?;
+
+    let collector = Arc::clone(&session);
+    let refresh: RefreshFn = Box::new(move || collector.collect());
+    let mutator = Arc::clone(&session);
+    let mutate: MutateFn = Box::new(move |op, stage| match stage {
+        Stage::Plan => mutator.plan(&op),
+        Stage::Apply => {
+            // The paths are recorded but not surfaced: the TUI has one
+            // header line, and `--json` on the CLI is where a backup
+            // list belongs.
+            let mut backups = HashMap::new();
+            mutator.apply(&op, &mut backups)
+        }
+    });
+
     shuvjobs_tui::run(RunOptions {
         initial,
         refresh: Some(refresh),
+        mutate: Some(mutate),
         refresh_secs,
+        dry_run: global.dry_run,
     })?;
     Ok(())
-}
-
-/// Construct one [`RemoteCollector`] up front and move it into the
-/// refresh closure so the SSH multiplex master persists across reloads.
-fn collect_with_refresh(global: &Global) -> Result<(Vec<ScheduledTask>, RefreshFn)> {
-    if let Some(host) = &global.host {
-        let collector = RemoteCollector::new(host.clone(), global.port, global.key.clone())
-            .with_sudo(global.sudo);
-        let initial = collector
-            .collect()
-            .with_context(|| format!("collecting from {host}"))?;
-        let refresh: RefreshFn = Box::new(move || collector.collect());
-        Ok((initial, refresh))
-    } else {
-        let initial = ops::collect_local();
-        let refresh: RefreshFn = Box::new(|| Ok(ops::collect_local()));
-        Ok((initial, refresh))
-    }
 }

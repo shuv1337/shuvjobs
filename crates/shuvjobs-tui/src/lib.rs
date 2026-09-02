@@ -2,13 +2,15 @@
 //! logic lives there in `shuvjobs_core::view`; this crate is just the keyboard
 //! and render layer.
 
+mod form;
+
 use std::collections::HashSet;
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -17,16 +19,19 @@ use crossterm::{
 };
 use ratatui::{
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    layout::{Constraint, Direction, Layout, Position, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame, Terminal,
 };
+use shuvjobs_core::manage::{Change, MutationOutcome};
 use shuvjobs_core::{
     view::{apply, Filter, SortMode},
-    ScheduleType, ScheduledTask, TaskSourceKind, TaskStatus,
+    Op, ScheduleType, ScheduledTask, TaskSourceKind, TaskStatus,
 };
+
+use crate::form::{Field, Form, FormEvent, Intent};
 
 /// Detail-pane absolute stamp: local wall clock plus the zone offset, so a
 /// timestamp is never ambiguous when read on another machine.
@@ -35,18 +40,37 @@ const ABSOLUTE_FMT: &str = "%Y-%m-%d %H:%M:%S %Z";
 const ONE_SHOT_FMT: &str = "%Y-%m-%d %H:%M %Z";
 const DATE_FMT: &str = "%Y-%m-%d";
 
-/// `initial` is the first paint. `refresh` is moved onto a background worker
-/// thread, so it must be `Send`; the event loop never calls it inline. If
-/// `refresh_secs` is set the TUI re-collects on that interval, measured from
-/// the last *completed* refresh; `r` re-collects on demand either way.
+/// `initial` is the first paint. `refresh` and `mutate` are moved onto one
+/// background worker thread, so they must be `Send`; the event loop never
+/// calls either inline. If `refresh_secs` is set the TUI re-collects on that
+/// interval, measured from the last *completed* refresh; `r` re-collects on
+/// demand either way. With `mutate` absent the TUI is exactly the read-only
+/// viewer it was, down to the footer hints.
 pub struct RunOptions {
     pub initial: Vec<ScheduledTask>,
     pub refresh: Option<RefreshFn>,
+    pub mutate: Option<MutateFn>,
     pub refresh_secs: Option<u64>,
+    /// `--dry-run`: the confirm popup still renders the plan, but `y`
+    /// reports "dry run: not applied" instead of writing anything.
+    pub dry_run: bool,
 }
 
-/// Collection callback. `Send` because it lives on the refresh worker thread.
+/// Collection callback. `Send` because it lives on the worker thread.
 pub type RefreshFn = Box<dyn FnMut() -> Result<Vec<ScheduledTask>> + Send>;
+
+/// Mutation callback, called twice per confirmed action: once to plan and
+/// once to apply. `Send` for the same reason as [`RefreshFn`].
+pub type MutateFn = Box<dyn FnMut(Op, Stage) -> Result<MutationOutcome> + Send>;
+
+/// Which half of a mutation the worker is being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Read-only: what would change. Feeds the confirm popup.
+    Plan,
+    /// Carry it out.
+    Apply,
+}
 
 pub fn run(opts: RunOptions) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
@@ -73,38 +97,115 @@ enum Mode {
     Normal,
     Filter,
     Search,
+    /// The add/edit popup owns the keyboard.
+    Form,
+    /// The rendered plan is up, waiting for `y` or `n`.
+    Confirm,
 }
 
-/// Owns the collection closure on a background thread so an SSH round-trip
-/// never blocks the event loop. The loop sends a unit request and picks the
+/// What the single in-flight worker request is for. One at a time keeps the
+/// reply channel unambiguous: every reply belongs to whatever `busy` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Busy {
+    Refresh,
+    Plan,
+    Apply,
+}
+
+enum Request {
+    Refresh,
+    /// Boxed: a whole `JobSpec` rides along, and a plain refresh should
+    /// not have to pay for the space.
+    Mutate {
+        op: Box<Op>,
+        stage: Stage,
+    },
+}
+
+/// One finished mutation, boxed into [`Reply::Mutated`] for the same
+/// reason [`Request::Mutate`] boxes its op.
+struct Mutated {
+    op: Op,
+    stage: Stage,
+    result: Result<MutationOutcome>,
+}
+
+enum Reply {
+    Refreshed(Result<Vec<ScheduledTask>>),
+    Mutated(Box<Mutated>),
+}
+
+/// Owns both host-facing closures on a background thread so an SSH round
+/// trip never blocks the event loop. The loop sends a request and picks the
 /// reply up later with `try_recv`.
-struct RefreshWorker {
-    requests: Sender<()>,
-    replies: Receiver<Result<Vec<ScheduledTask>>>,
+struct Worker {
+    requests: Sender<Request>,
+    replies: Receiver<Reply>,
+    /// Whether `a`/`e`/`d`/`t` do anything at all.
+    can_mutate: bool,
+    can_refresh: bool,
 }
 
-impl RefreshWorker {
-    fn spawn(mut refresh: RefreshFn) -> Self {
-        let (req_tx, req_rx) = mpsc::channel::<()>();
-        let (rep_tx, rep_rx) = mpsc::channel::<Result<Vec<ScheduledTask>>>();
+impl Worker {
+    /// `None` when there is nothing to run: a viewer opened on a static
+    /// snapshot has no thread and no channels.
+    fn spawn(refresh: Option<RefreshFn>, mutate: Option<MutateFn>) -> Option<Self> {
+        let (can_refresh, can_mutate) = (refresh.is_some(), mutate.is_some());
+        if !can_refresh && !can_mutate {
+            return None;
+        }
+        let (req_tx, req_rx) = mpsc::channel::<Request>();
+        let (rep_tx, rep_rx) = mpsc::channel::<Reply>();
         // Deliberately detached: the handle is dropped, never joined. When the
         // App goes away `req_tx` drops, `recv` fails, and the thread ends after
         // whatever call it is inside returns. A worker stuck in a slow SSH call
         // is left to finish on its own after the terminal has been restored, so
         // quitting is always immediate instead of waiting on the network.
         thread::spawn(move || {
-            while req_rx.recv().is_ok() {
-                let result = refresh();
-                if rep_tx.send(result).is_err() {
+            let mut refresh = refresh;
+            let mut mutate = mutate;
+            while let Ok(request) = req_rx.recv() {
+                let reply = match request {
+                    Request::Refresh => Reply::Refreshed(match refresh.as_mut() {
+                        Some(refresh) => refresh(),
+                        None => Err(anyhow!("collection is not available")),
+                    }),
+                    Request::Mutate { op, stage } => {
+                        let op = *op;
+                        let result = match mutate.as_mut() {
+                            Some(mutate) => mutate(op.clone(), stage),
+                            None => Err(anyhow!("this session cannot change jobs")),
+                        };
+                        Reply::Mutated(Box::new(Mutated { op, stage, result }))
+                    }
+                };
+                if rep_tx.send(reply).is_err() {
                     break;
                 }
             }
         });
-        Self {
+        Some(Self {
             requests: req_tx,
             replies: rep_rx,
-        }
+            can_mutate,
+            can_refresh,
+        })
     }
+}
+
+/// A mutation the operator has asked for and not yet confirmed.
+struct Pending {
+    op: Op,
+    /// `None` only while the plan request is still in flight.
+    plan: Option<MutationOutcome>,
+    scroll: u16,
+}
+
+/// The one-line result of the last action, shown in the header until the
+/// next one replaces it.
+struct Notice {
+    text: String,
+    is_error: bool,
 }
 
 struct App {
@@ -117,14 +218,21 @@ struct App {
     mode: Mode,
     filter_cursor: usize,
     detail_open: bool,
-    worker: Option<RefreshWorker>,
+    worker: Option<Worker>,
     refresh_secs: Option<u64>,
     /// Start of the interval countdown: set when a refresh *completes*, so a
     /// slow collection never queues up back-to-back refreshes.
     last_refresh: Instant,
-    refreshing: bool,
+    /// The single in-flight request, if any.
+    busy: Option<Busy>,
     /// First line of the last failed collection, kept until one succeeds.
     refresh_error: Option<String>,
+    /// Open add/edit popup.
+    form: Option<Form>,
+    /// The mutation being planned or confirmed.
+    pending: Option<Pending>,
+    notice: Option<Notice>,
+    dry_run: bool,
     quit: bool,
 }
 
@@ -145,11 +253,15 @@ impl App {
             mode: Mode::Normal,
             filter_cursor: 0,
             detail_open: false,
-            worker: opts.refresh.map(RefreshWorker::spawn),
+            worker: Worker::spawn(opts.refresh, opts.mutate),
             refresh_secs: opts.refresh_secs,
             last_refresh: Instant::now(),
-            refreshing: false,
+            busy: None,
             refresh_error: None,
+            form: None,
+            pending: None,
+            notice: None,
+            dry_run: opts.dry_run,
             quit: false,
         };
         app.refilter();
@@ -200,7 +312,21 @@ impl App {
             Mode::Normal => self.handle_normal(code),
             Mode::Filter => self.handle_filter(code),
             Mode::Search => self.handle_search(code),
+            Mode::Form => self.handle_form(code),
+            Mode::Confirm => self.handle_confirm(code),
         }
+    }
+
+    fn selected(&self) -> Option<&ScheduledTask> {
+        self.table_state
+            .selected()
+            .and_then(|i| self.visible.get(i))
+    }
+
+    /// Whether a mutation key should do anything: there has to be a
+    /// handle, and nothing may already be in flight.
+    fn can_mutate(&self) -> bool {
+        self.worker.as_ref().is_some_and(|w| w.can_mutate) && self.busy.is_none()
     }
 
     fn handle_normal(&mut self, code: KeyCode) {
@@ -226,6 +352,10 @@ impl App {
             }
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('r') => self.request_refresh(),
+            KeyCode::Char('a') if self.can_mutate() => self.open_add(),
+            KeyCode::Char('e') if self.can_mutate() => self.open_edit(),
+            KeyCode::Char('d') if self.can_mutate() => self.start_delete(),
+            KeyCode::Char('t') if self.can_mutate() => self.start_toggle(),
             KeyCode::Char('/') => {
                 self.mode = Mode::Search;
             }
@@ -280,18 +410,176 @@ impl App {
         }
     }
 
-    /// Ask the worker to collect. Ignored when a refresh is already in
+    /// `a`: a blank form for whichever source this machine actually has,
+    /// falling back to cron on an empty table.
+    fn open_add(&mut self) {
+        let source = self
+            .available_sources
+            .first()
+            .copied()
+            .unwrap_or(TaskSourceKind::Cron);
+        self.notice = None;
+        self.form = Some(Form::new_add(source));
+        self.mode = Mode::Form;
+    }
+
+    /// `e`: the same form, prefilled from the selected row.
+    fn open_edit(&mut self) {
+        let Some(task) = self.selected() else {
+            return;
+        };
+        let form = Form::from_task(task);
+        self.notice = None;
+        self.form = Some(form);
+        self.mode = Mode::Form;
+    }
+
+    fn start_delete(&mut self) {
+        let Some(task) = self.selected() else {
+            return;
+        };
+        let op = Op::Delete {
+            id: task.id.clone(),
+            source: task.source,
+        };
+        self.send_mutation(op, Stage::Plan);
+    }
+
+    /// `t`: a job whose state we could not read is assumed to be on, so
+    /// the obvious next step is turning it off.
+    fn start_toggle(&mut self) {
+        let Some(task) = self.selected() else {
+            return;
+        };
+        let op = Op::SetEnabled {
+            id: task.id.clone(),
+            source: task.source,
+            enabled: !task.enabled.unwrap_or(true),
+        };
+        self.send_mutation(op, Stage::Plan);
+    }
+
+    fn handle_form(&mut self, code: KeyCode) {
+        let Some(form) = self.form.as_mut() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let op = match form.handle_key(code) {
+            FormEvent::Consumed => return,
+            FormEvent::Cancel => {
+                self.form = None;
+                self.mode = Mode::Normal;
+                return;
+            }
+            FormEvent::Submit(spec) => {
+                let op = match &form.intent {
+                    Intent::Add => Op::Create(spec),
+                    Intent::Edit { id } => Op::Update {
+                        id: id.clone(),
+                        source: form.source,
+                        spec,
+                    },
+                };
+                // Locked until the plan comes back: the worker is
+                // planning this exact spec, and an edit under it would
+                // make the confirm popup a lie.
+                form.locked = true;
+                op
+            }
+        };
+        if !self.send_mutation(op, Stage::Plan) {
+            if let Some(form) = self.form.as_mut() {
+                form.locked = false;
+            }
+        }
+    }
+
+    fn handle_confirm(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => self.confirm_apply(),
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.pending = None;
+                self.form = None;
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_confirm(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_confirm(-1),
+            KeyCode::PageDown => self.scroll_confirm(10),
+            KeyCode::PageUp => self.scroll_confirm(-10),
+            _ => {}
+        }
+    }
+
+    fn scroll_confirm(&mut self, delta: i32) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        let next = i64::from(pending.scroll) + i64::from(delta);
+        pending.scroll = next.clamp(0, i64::from(u16::MAX)) as u16;
+    }
+
+    fn confirm_apply(&mut self) {
+        if self.dry_run {
+            // The plan was rendered from a read-only pass; there is
+            // nothing to undo and nothing to report but the refusal.
+            self.notice = Some(Notice {
+                text: "dry run: not applied".to_string(),
+                is_error: false,
+            });
+            self.pending = None;
+            self.form = None;
+            self.mode = Mode::Normal;
+            return;
+        }
+        let Some(op) = self.pending.as_ref().map(|p| p.op.clone()) else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        self.send_mutation(op, Stage::Apply);
+    }
+
+    /// Hand one half of a mutation to the worker. `false` means nothing
+    /// was sent: no handle, something already in flight, or a dead
+    /// worker — in every case the caller must not pretend it started.
+    fn send_mutation(&mut self, op: Op, stage: Stage) -> bool {
+        if self.busy.is_some() {
+            return false;
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            return false;
+        };
+        if !worker.can_mutate {
+            return false;
+        }
+        let request = Request::Mutate {
+            op: Box::new(op),
+            stage,
+        };
+        if worker.requests.send(request).is_err() {
+            return false;
+        }
+        self.busy = Some(match stage {
+            Stage::Plan => Busy::Plan,
+            Stage::Apply => Busy::Apply,
+        });
+        true
+    }
+
+    /// Ask the worker to collect. Ignored when a request is already in
     /// flight — one at a time keeps the reply channel unambiguous and
     /// stops `r` mashing from queueing up SSH sessions.
     fn request_refresh(&mut self) {
-        if self.refreshing {
+        if self.busy.is_some() {
             return;
         }
         let Some(worker) = self.worker.as_ref() else {
             return;
         };
-        if worker.requests.send(()).is_ok() {
-            self.refreshing = true;
+        if !worker.can_refresh {
+            return;
+        }
+        if worker.requests.send(Request::Refresh).is_ok() {
+            self.busy = Some(Busy::Refresh);
         }
     }
 
@@ -301,24 +589,104 @@ impl App {
         let Some(secs) = self.refresh_secs else {
             return;
         };
-        if self.refreshing || self.last_refresh.elapsed() < StdDuration::from_secs(secs) {
+        if self.busy.is_some() || self.last_refresh.elapsed() < StdDuration::from_secs(secs) {
+            return;
+        }
+        // Never pull the rows out from under an open popup: the form and
+        // the confirmed plan both describe a row that is on screen now.
+        if matches!(self.mode, Mode::Form | Mode::Confirm) {
             return;
         }
         self.request_refresh();
     }
 
-    /// Non-blocking check for a finished collection.
-    fn poll_refresh(&mut self) {
+    /// Non-blocking check for a finished request. `true` when a reply was
+    /// folded in, which is what the tests wait on.
+    fn poll_worker(&mut self) -> bool {
         let Some(worker) = self.worker.as_ref() else {
-            return;
+            return false;
         };
         match worker.replies.try_recv() {
-            Ok(result) => self.apply_refresh(result),
-            Err(TryRecvError::Empty) => {}
+            Ok(Reply::Refreshed(result)) => {
+                self.apply_refresh(result);
+                true
+            }
+            Ok(Reply::Mutated(mutated)) => {
+                let Mutated { op, stage, result } = *mutated;
+                self.apply_mutation_reply(op, stage, result);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
             // The worker died (panicked). Stop expecting replies.
             Err(TryRecvError::Disconnected) => {
                 self.worker = None;
-                self.refreshing = false;
+                self.busy = None;
+                false
+            }
+        }
+    }
+
+    /// Fold one half of a mutation back into the UI.
+    ///
+    /// A plan failure with the form still open belongs *in* the form —
+    /// the operator is one keystroke from fixing the field that caused
+    /// it — while everything else becomes a header notice.
+    fn apply_mutation_reply(&mut self, op: Op, stage: Stage, result: Result<MutationOutcome>) {
+        self.busy = None;
+        match (stage, result) {
+            (Stage::Plan, Ok(outcome)) => {
+                self.pending = Some(Pending {
+                    op,
+                    plan: Some(outcome),
+                    scroll: 0,
+                });
+                self.form = None;
+                self.mode = Mode::Confirm;
+            }
+            (Stage::Plan, Err(err)) => {
+                let message = first_line(&err);
+                match self.form.as_mut() {
+                    Some(form) => {
+                        form.locked = false;
+                        form.error = Some(message);
+                        self.mode = Mode::Form;
+                    }
+                    None => {
+                        self.notice = Some(Notice {
+                            text: message,
+                            is_error: true,
+                        });
+                        self.pending = None;
+                        self.mode = Mode::Normal;
+                    }
+                }
+            }
+            (Stage::Apply, Ok(outcome)) => {
+                let id = outcome
+                    .id
+                    .clone()
+                    .or_else(|| op.id().map(str::to_string))
+                    .unwrap_or_default();
+                let text = format!("{} {id}", past_tense(&op));
+                self.notice = Some(Notice {
+                    text: text.trim_end().to_string(),
+                    is_error: false,
+                });
+                self.pending = None;
+                self.form = None;
+                self.mode = Mode::Normal;
+                // The rows on screen describe the machine before the
+                // write; ask for the ones that describe it after.
+                self.request_refresh();
+            }
+            (Stage::Apply, Err(err)) => {
+                self.notice = Some(Notice {
+                    text: first_line(&err),
+                    is_error: true,
+                });
+                self.pending = None;
+                self.form = None;
+                self.mode = Mode::Normal;
             }
         }
     }
@@ -327,7 +695,7 @@ impl App {
     /// data and only records a message, so a flaky link never blanks the table
     /// or drops the user out of the TUI.
     fn apply_refresh(&mut self, result: Result<Vec<ScheduledTask>>) {
-        self.refreshing = false;
+        self.busy = None;
         self.last_refresh = Instant::now();
         match result {
             Ok(tasks) => {
@@ -343,13 +711,115 @@ impl App {
                 }
                 self.refilter();
             }
-            Err(e) => {
-                let msg = e.to_string();
-                let first = msg.lines().next().unwrap_or("unknown error").to_string();
-                self.refresh_error = Some(first);
-            }
+            Err(e) => self.refresh_error = Some(first_line(&e)),
         }
     }
+}
+
+/// Errors are shown in one line of header or one line of form, so only
+/// the first line of a chain ever fits.
+fn first_line(err: &anyhow::Error) -> String {
+    let text = err.to_string();
+    text.lines().next().unwrap_or("unknown error").to_string()
+}
+
+/// What the success notice calls the thing that just happened.
+fn past_tense(op: &Op) -> &'static str {
+    match op {
+        Op::Create(_) => "added",
+        Op::Update { .. } => "edited",
+        Op::Delete { .. } => "removed",
+        Op::SetEnabled { enabled: true, .. } => "enabled",
+        Op::SetEnabled { enabled: false, .. } => "disabled",
+    }
+}
+
+/// The confirm popup's body: what this plan writes, removes, and runs,
+/// then whatever the writer wanted to say about it.
+///
+/// The diff is deliberately minimal — changed lines only, no context and
+/// no hunk headers. A full unified diff is the CLI's job, where there is
+/// a pager; here the popup has to fit over the table.
+pub fn render_outcome(outcome: &MutationOutcome) -> Vec<String> {
+    let mut lines = Vec::new();
+    for change in &outcome.changes {
+        match change {
+            Change::WriteFile {
+                path,
+                before,
+                after,
+                ..
+            } => {
+                lines.push(format!("write {path}"));
+                lines.extend(line_diff(before.as_deref().unwrap_or(""), after));
+            }
+            Change::RemoveFile { path, before, .. } => {
+                lines.push(format!("remove {path}"));
+                lines.extend(line_diff(before.as_deref().unwrap_or(""), ""));
+            }
+            Change::Command { cmd, .. } => lines.push(format!("run {cmd}")),
+        }
+    }
+    if !outcome.notes.is_empty() {
+        lines.push("notes:".to_string());
+        for note in &outcome.notes {
+            lines.push(format!("  {note}"));
+        }
+    }
+    lines
+}
+
+/// Longest common subsequence over lines, capped so a pathological pair
+/// of large files degrades to a set difference instead of allocating a
+/// table nobody is going to read anyway.
+const LCS_CELL_LIMIT: usize = 250_000;
+
+fn line_diff(before: &str, after: &str) -> Vec<String> {
+    let a: Vec<&str> = before.lines().collect();
+    let b: Vec<&str> = after.lines().collect();
+    if a.len().saturating_mul(b.len()) > LCS_CELL_LIMIT {
+        let mut out: Vec<String> = a
+            .iter()
+            .filter(|line| !b.contains(line))
+            .map(|line| format!("-{line}"))
+            .collect();
+        out.extend(
+            b.iter()
+                .filter(|line| !a.contains(line))
+                .map(|line| format!("+{line}")),
+        );
+        return out;
+    }
+
+    // lcs[i][j] = length of the longest common subsequence of a[i..] and b[j..].
+    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push(format!("-{}", a[i]));
+            i += 1;
+        } else {
+            out.push(format!("+{}", b[j]));
+            j += 1;
+        }
+    }
+    out.extend(a[i..].iter().map(|line| format!("-{line}")));
+    out.extend(b[j..].iter().map(|line| format!("+{line}")));
+    out
 }
 
 fn available_sources_of(tasks: &[ScheduledTask]) -> Vec<TaskSourceKind> {
@@ -378,7 +848,7 @@ where
     let mut app = App::new(opts);
 
     while !app.quit {
-        app.poll_refresh();
+        app.poll_worker();
         app.maybe_auto_refresh();
 
         let now = Utc::now();
@@ -386,7 +856,7 @@ where
 
         // Poll briefly whenever a reply or an interval tick may be due, so the
         // header indicator and fresh data land without waiting on a keypress.
-        let poll_for = if app.refreshing || app.refresh_secs.is_some() {
+        let poll_for = if app.busy.is_some() || app.refresh_secs.is_some() {
             StdDuration::from_millis(100)
         } else {
             StdDuration::from_millis(500)
@@ -442,8 +912,9 @@ fn draw_app(frame: &mut Frame, app: &mut App, now: DateTime<Utc>) {
         header_area,
         app.all.len(),
         app.visible.len(),
-        app.refreshing,
+        app.busy,
         app.refresh_error.as_deref(),
+        app.notice.as_ref(),
     );
     // Pull table_state out by copy — render_stateful_widget needs it mutably
     // while the row builders below borrow other app fields.
@@ -467,8 +938,23 @@ fn draw_app(frame: &mut Frame, app: &mut App, now: DateTime<Utc>) {
                 app.filter_cursor,
             ),
             Mode::Search => draw_search_bar(frame, area, &app.filter.search),
-            Mode::Normal => {}
+            Mode::Normal | Mode::Form | Mode::Confirm => {}
         }
+    }
+    // Popups sit over the table, not beside it: the row being changed
+    // stays visible around the edges.
+    match app.mode {
+        Mode::Form => {
+            if let Some(form) = &app.form {
+                draw_form(frame, body_area, form);
+            }
+        }
+        Mode::Confirm => {
+            if let Some(pending) = &app.pending {
+                draw_confirm(frame, body_area, pending, app.dry_run);
+            }
+        }
+        _ => {}
     }
     draw_footer(
         frame,
@@ -476,6 +962,147 @@ fn draw_app(frame: &mut Frame, app: &mut App, now: DateTime<Utc>) {
         &app.filter,
         app.sort,
         &app.available_sources,
+        app.worker.as_ref().is_some_and(|w| w.can_mutate),
+    );
+}
+
+/// A centred box `width` by `height`, clamped to `area`.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Popups are wide enough for a cron line plus a label, and never wider
+/// than the body they cover.
+fn popup_width(area: Rect) -> u16 {
+    area.width.saturating_sub(4).min(72)
+}
+
+/// Label column, wide enough for the longest field name plus a space.
+const FORM_LABEL_WIDTH: u16 = 10;
+
+fn draw_form(frame: &mut Frame, area: Rect, form: &Form) {
+    let fields = form.visible_fields();
+    // fields + hint + error, inside a border.
+    let height = fields.len() as u16 + 4;
+    let popup = centered(area, popup_width(area), height);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", form.title()));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cursor: Option<Position> = None;
+    for (row, field) in fields.iter().enumerate() {
+        let label = format!(
+            "{:<width$}",
+            field.label(),
+            width = FORM_LABEL_WIDTH as usize
+        );
+        let focused = *field == form.focus;
+        let label_style = if focused {
+            Style::default().bold()
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        let mut spans = vec![Span::styled(label, label_style)];
+        if field.is_picker() {
+            spans.push(Span::raw(format!("◂ {} ▸", form.picker_value(*field))));
+        } else if let Some(input) = form.input(*field) {
+            if input.value.is_empty() && *field == Field::Schedule {
+                spans.push(Span::styled(
+                    form.schedule_hint().to_string(),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            } else {
+                spans.push(Span::raw(input.value.clone()));
+            }
+            if focused {
+                cursor = Some(Position::new(
+                    inner.x + FORM_LABEL_WIDTH + input.cursor as u16,
+                    inner.y + row as u16,
+                ));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    match &form.error {
+        Some(error) => lines.push(Line::styled(
+            format!("error: {error}"),
+            Style::default().fg(Color::Red),
+        )),
+        None => lines.push(Line::styled(
+            "Tab field · ◂ ▸ change · Enter plan · Esc cancel",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    if let Some(position) = cursor {
+        if !form.locked {
+            frame.set_cursor_position(position);
+        }
+    }
+}
+
+/// The title of the confirm popup: exactly which job is about to change.
+fn confirm_title(op: &Op) -> String {
+    format!(
+        "{} {} {}",
+        op.verb(),
+        op.source(),
+        op.id().unwrap_or("(new)")
+    )
+}
+
+fn draw_confirm(frame: &mut Frame, area: Rect, pending: &Pending, dry_run: bool) {
+    let body: Vec<String> = pending
+        .plan
+        .as_ref()
+        .map(render_outcome)
+        .unwrap_or_else(|| vec!["planning…".to_string()]);
+    let height = (body.len() as u16 + 4).min(area.height);
+    let popup = centered(area, popup_width(area), height);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", confirm_title(&pending.op)));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = body
+        .into_iter()
+        .map(|text| {
+            let style = match text.as_bytes().first() {
+                Some(b'+') => Style::default().fg(Color::Green),
+                Some(b'-') => Style::default().fg(Color::Red),
+                _ => Style::default(),
+            };
+            Line::styled(text, style)
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        if dry_run {
+            "dry run · Esc close"
+        } else {
+            "y apply · n cancel"
+        },
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((pending.scroll, 0))
+            .wrap(Wrap { trim: false }),
+        inner,
     );
 }
 
@@ -484,15 +1111,26 @@ fn draw_app(frame: &mut Frame, app: &mut App, now: DateTime<Utc>) {
 fn header_text(
     total: usize,
     shown: usize,
-    refreshing: bool,
+    busy: Option<Busy>,
     refresh_error: Option<&str>,
+    notice: Option<&Notice>,
 ) -> String {
     let mut text = format!("ShuvJobs — {shown}/{total} task(s)");
-    if refreshing {
-        text.push_str(" · refreshing…");
+    match busy {
+        Some(Busy::Refresh) => text.push_str(" · refreshing…"),
+        Some(Busy::Plan) => text.push_str(" · planning…"),
+        Some(Busy::Apply) => text.push_str(" · applying…"),
+        None => {}
     }
     if let Some(err) = refresh_error {
         text.push_str(&format!(" · refresh failed: {err}"));
+    }
+    if let Some(notice) = notice {
+        if notice.is_error {
+            text.push_str(&format!(" · error: {}", notice.text));
+        } else {
+            text.push_str(&format!(" · {}", notice.text));
+        }
     }
     text
 }
@@ -502,10 +1140,11 @@ fn draw_header(
     area: Rect,
     total: usize,
     shown: usize,
-    refreshing: bool,
+    busy: Option<Busy>,
     refresh_error: Option<&str>,
+    notice: Option<&Notice>,
 ) {
-    let mut text = header_text(total, shown, refreshing, refresh_error);
+    let mut text = header_text(total, shown, busy, refresh_error, notice);
     text.insert(0, ' ');
     text.push(' ');
     let para = Paragraph::new(Line::from(text)).style(
@@ -602,13 +1241,27 @@ fn draw_detail(frame: &mut Frame, area: Rect, task: Option<&ScheduledTask>, now:
 fn format_detail(t: &ScheduledTask, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let mut lines = vec![
         kv("Name", &t.name),
+        // The id is what `e`, `d`, and every CLI subcommand address the
+        // job by, so it belongs where the operator can read it off.
+        kv("Id", &t.id),
         kv("Source", format_source(t.source)),
         kv("Command", &t.command),
         kv("Schedule", &format_schedule(&t.schedule)),
         kv("Last run", &format_dt_with_relative(t.last_run, now)),
         kv("Next run", &format_dt_with_relative(t.next_run, now)),
         kv("Status", &format_status_long(t.last_status.as_ref())),
+        kv(
+            "Enabled",
+            match t.enabled {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "-",
+            },
+        ),
     ];
+    if let Some(location) = &t.location {
+        lines.push(kv("Location", location));
+    }
     if let Some(d) = t.last_duration {
         lines.push(kv("Duration", &format!("{:.2}s", d.as_secs_f64())));
     }
@@ -693,6 +1346,7 @@ fn draw_footer(
     filter: &Filter,
     sort: SortMode,
     available: &[TaskSourceKind],
+    can_mutate: bool,
 ) {
     let mut state_parts: Vec<String> = Vec::new();
     if let Some(allowed) = &filter.allowed_sources {
@@ -717,8 +1371,19 @@ fn draw_footer(
         format!(" {} ", state_parts.join(" · "))
     };
 
-    let full = "/ search · f filter · s sort · r refresh · Enter detail · q quit ";
-    let narrow = "/ · f · s · r · q ";
+    // Without a mutate handle the action keys do nothing, so promising
+    // them in the footer would be a lie.
+    let (full, narrow) = if can_mutate {
+        (
+            "a add · e edit · d delete · t toggle · / search · f filter · s sort · r refresh · Enter detail · q quit ",
+            "a e d t / f s r q ",
+        )
+    } else {
+        (
+            "/ search · f filter · s sort · r refresh · Enter detail · q quit ",
+            "/ · f · s · r · q ",
+        )
+    };
     let width = area.width as usize;
     let right = if width >= left.chars().count() + full.chars().count() + 3 {
         full
@@ -1008,7 +1673,9 @@ mod tests {
         App::new(RunOptions {
             initial: tasks,
             refresh: None,
+            mutate: None,
             refresh_secs: None,
+            dry_run: false,
         })
     }
 
@@ -1083,7 +1750,7 @@ mod tests {
     fn refresh_key_without_a_collector_is_inert() {
         let mut app = app_with(vec![task("a", TaskSourceKind::Cron)]);
         app.handle_key(KeyCode::Char('r'));
-        assert!(!app.refreshing, "no worker, nothing to wait for");
+        assert!(app.busy.is_none(), "no worker, nothing to wait for");
     }
 
     #[test]
@@ -1099,19 +1766,25 @@ mod tests {
                 release_rx.recv().ok();
                 Ok(vec![task("alpha", TaskSourceKind::Cron)])
             })),
+            mutate: None,
             refresh_secs: None,
+            dry_run: false,
         });
 
         app.handle_key(KeyCode::Char('r'));
-        assert!(app.refreshing);
+        assert_eq!(app.busy, Some(Busy::Refresh));
         started_rx
             .recv_timeout(StdDuration::from_secs(5))
             .expect("worker picked the request up");
 
         app.handle_key(KeyCode::Char('r'));
-        assert!(app.refreshing);
-        app.poll_refresh();
-        assert!(app.refreshing, "no reply yet, still in flight");
+        assert_eq!(app.busy, Some(Busy::Refresh));
+        app.poll_worker();
+        assert_eq!(
+            app.busy,
+            Some(Busy::Refresh),
+            "no reply yet, still in flight"
+        );
         assert_eq!(
             started_rx.try_recv(),
             Err(TryRecvError::Empty),
@@ -1121,13 +1794,13 @@ mod tests {
         release_tx.send(()).unwrap();
         // The reply may not have landed on the very first poll.
         for _ in 0..100 {
-            app.poll_refresh();
-            if !app.refreshing {
+            app.poll_worker();
+            if app.busy.is_none() {
                 break;
             }
             thread::sleep(StdDuration::from_millis(10));
         }
-        assert!(!app.refreshing, "reply applied");
+        assert!(app.busy.is_none(), "reply applied");
         assert!(app.refresh_error.is_none());
     }
 
@@ -1141,14 +1814,14 @@ mod tests {
         app.handle_key(KeyCode::End);
         assert_eq!(app.table_state.selected(), Some(2));
         app.refresh_error = Some("stale".into());
-        app.refreshing = true;
+        app.busy = Some(Busy::Refresh);
 
         app.apply_refresh(Ok(vec![
             task("delta", TaskSourceKind::Cron),
             task("echo", TaskSourceKind::Systemd),
         ]));
 
-        assert!(!app.refreshing);
+        assert!(app.busy.is_none());
         assert!(app.refresh_error.is_none(), "a success clears the error");
         assert_eq!(app.visible.len(), 2);
         assert_eq!(
@@ -1171,11 +1844,11 @@ mod tests {
     #[test]
     fn failed_refresh_keeps_the_last_good_data() {
         let mut app = app_with(vec![task("alpha", TaskSourceKind::Cron)]);
-        app.refreshing = true;
+        app.busy = Some(Busy::Refresh);
 
         app.apply_refresh(Err(anyhow::anyhow!("ssh: connect failed\nsecond line")));
 
-        assert!(!app.refreshing);
+        assert!(app.busy.is_none());
         assert_eq!(app.refresh_error.as_deref(), Some("ssh: connect failed"));
         assert_eq!(app.visible.len(), 1, "old rows survive a failure");
         assert_eq!(app.visible[0].name, "alpha");
@@ -1187,14 +1860,549 @@ mod tests {
 
     #[test]
     fn header_shows_in_flight_and_failure_state() {
-        assert_eq!(header_text(3, 2, false, None), "ShuvJobs — 2/3 task(s)");
         assert_eq!(
-            header_text(3, 3, true, None),
+            header_text(3, 2, None, None, None),
+            "ShuvJobs — 2/3 task(s)"
+        );
+        assert_eq!(
+            header_text(3, 3, Some(Busy::Refresh), None, None),
             "ShuvJobs — 3/3 task(s) · refreshing…"
         );
         assert_eq!(
-            header_text(3, 3, true, Some("ssh: connect failed")),
+            header_text(3, 3, Some(Busy::Refresh), Some("ssh: connect failed"), None),
             "ShuvJobs — 3/3 task(s) · refreshing… · refresh failed: ssh: connect failed"
+        );
+        assert_eq!(
+            header_text(3, 3, Some(Busy::Plan), None, None),
+            "ShuvJobs — 3/3 task(s) · planning…"
+        );
+        assert_eq!(
+            header_text(
+                3,
+                3,
+                Some(Busy::Apply),
+                None,
+                Some(&Notice {
+                    text: "added user:alice:4".into(),
+                    is_error: false
+                })
+            ),
+            "ShuvJobs — 3/3 task(s) · applying… · added user:alice:4"
+        );
+        assert_eq!(
+            header_text(
+                3,
+                3,
+                None,
+                None,
+                Some(&Notice {
+                    text: "needs root".into(),
+                    is_error: true
+                })
+            ),
+            "ShuvJobs — 3/3 task(s) · error: needs root"
+        );
+    }
+    // ---- mutation flow -------------------------------------------------
+
+    use crate::form::Intent;
+    use shuvjobs_core::host::Privilege;
+    use shuvjobs_core::manage::{JobScope, MutationOutcome};
+
+    /// A fake mutate handle: it announces every `(op, stage)` it is asked
+    /// for on a channel and answers from a scripted list, so a whole
+    /// plan/confirm/apply round trip is deterministic.
+    fn app_with_mutator(
+        tasks: Vec<ScheduledTask>,
+        replies: Vec<Result<MutationOutcome>>,
+    ) -> (App, Receiver<(Op, Stage)>) {
+        app_with_mutator_opts(tasks, replies, false)
+    }
+
+    fn app_with_mutator_opts(
+        tasks: Vec<ScheduledTask>,
+        replies: Vec<Result<MutationOutcome>>,
+        dry_run: bool,
+    ) -> (App, Receiver<(Op, Stage)>) {
+        let (calls_tx, calls_rx) = mpsc::channel::<(Op, Stage)>();
+        let mut replies = replies.into_iter();
+        let app = App::new(RunOptions {
+            initial: tasks,
+            refresh: Some(Box::new(|| Ok(Vec::new()))),
+            mutate: Some(Box::new(move |op, stage| {
+                calls_tx.send((op, stage)).ok();
+                replies
+                    .next()
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("no scripted reply")))
+            })),
+            refresh_secs: None,
+            dry_run,
+        });
+        (app, calls_rx)
+    }
+
+    /// Wait for exactly one worker reply to be folded in.
+    fn pump(app: &mut App) {
+        for _ in 0..500 {
+            if app.poll_worker() {
+                return;
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        panic!("no reply from the worker");
+    }
+
+    fn next_call(calls: &Receiver<(Op, Stage)>) -> (Op, Stage) {
+        calls
+            .recv_timeout(StdDuration::from_secs(5))
+            .expect("the worker was asked for something")
+    }
+
+    fn plan_outcome() -> MutationOutcome {
+        MutationOutcome {
+            id: Some("user:alice:4".into()),
+            changes: vec![Change::WriteFile {
+                path: "/etc/cron.d/x".into(),
+                before: Some("old\n".into()),
+                after: "new\n".into(),
+                mode: 0o644,
+                privilege: Privilege::Root,
+            }],
+            applied: false,
+            outputs: Vec::new(),
+            notes: vec!["needs a reload".into()],
+        }
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(KeyCode::Char(c));
+        }
+    }
+
+    /// Fill a fresh cron add form: Source, Scope, Schedule, Command, Enabled.
+    fn fill_cron_form(app: &mut App) {
+        app.handle_key(KeyCode::Tab);
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(app.form.as_ref().unwrap().focus, Field::Schedule);
+        type_text(app, "*/5 * * * *");
+        app.handle_key(KeyCode::Tab);
+        type_text(app, "echo hi");
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn mutation_keys_are_inert_without_a_handle() {
+        let mut app = app_with(vec![task("alpha", TaskSourceKind::Cron)]);
+        for code in ['a', 'e', 'd', 't'] {
+            app.handle_key(KeyCode::Char(code));
+            assert_eq!(app.mode, Mode::Normal, "`{code}` did something");
+        }
+        assert!(app.form.is_none());
+        assert!(app.pending.is_none());
+        assert!(app.busy.is_none());
+    }
+
+    #[test]
+    fn add_opens_a_form_focused_on_the_source_picker() {
+        let (mut app, calls) = app_with_mutator(vec![task("alpha", TaskSourceKind::Cron)], vec![]);
+        app.handle_key(KeyCode::Char('a'));
+        assert_eq!(app.mode, Mode::Form);
+        let form = app.form.as_ref().expect("form");
+        assert_eq!(form.intent, Intent::Add);
+        assert_eq!(form.focus, Field::Source);
+        assert_eq!(form.source, TaskSourceKind::Cron, "the only source present");
+        assert!(form.command.value.is_empty());
+        assert_eq!(
+            calls.try_recv(),
+            Err(TryRecvError::Empty),
+            "opening a form asks the host nothing"
+        );
+    }
+
+    #[test]
+    fn edit_prefills_from_the_row_and_hides_the_source() {
+        let mut row = task("backup", TaskSourceKind::Cron);
+        row.id = "user:alice:4".into();
+        row.command = "echo hi".into();
+        row.schedule = ScheduleType::Cron("0 9 * * *".into());
+        let (mut app, _calls) = app_with_mutator(vec![row], vec![]);
+
+        app.handle_key(KeyCode::Char('e'));
+        assert_eq!(app.mode, Mode::Form);
+        let form = app.form.as_ref().expect("form");
+        assert_eq!(
+            form.intent,
+            Intent::Edit {
+                id: "user:alice:4".into()
+            }
+        );
+        assert_eq!(form.schedule.value, "0 9 * * *");
+        assert_eq!(form.command.value, "echo hi");
+        assert_eq!(form.scope, JobScope::User, "`user:` is this user's crontab");
+        assert!(!form.visible_fields().contains(&Field::Source));
+        assert_eq!(form.focus, Field::Scope);
+    }
+
+    #[test]
+    fn tab_backtab_and_text_keys_edit_the_focused_field() {
+        let (mut app, _calls) = app_with_mutator(vec![task("a", TaskSourceKind::Cron)], vec![]);
+        app.handle_key(KeyCode::Char('a'));
+        app.handle_key(KeyCode::Tab);
+        assert_eq!(app.form.as_ref().unwrap().focus, Field::Scope);
+        app.handle_key(KeyCode::Tab);
+        type_text(&mut app, "@daily");
+        app.handle_key(KeyCode::Backspace);
+        assert_eq!(app.form.as_ref().unwrap().schedule.value, "@dail");
+        app.handle_key(KeyCode::BackTab);
+        assert_eq!(app.form.as_ref().unwrap().focus, Field::Scope);
+        app.handle_key(KeyCode::BackTab);
+        assert_eq!(app.form.as_ref().unwrap().focus, Field::Source);
+    }
+
+    #[test]
+    fn esc_closes_the_form_without_asking_the_host() {
+        let (mut app, calls) = app_with_mutator(vec![task("a", TaskSourceKind::Cron)], vec![]);
+        app.handle_key(KeyCode::Char('a'));
+        fill_cron_form(&mut app);
+        app.handle_key(KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.form.is_none());
+        assert!(app.busy.is_none());
+        assert_eq!(calls.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn an_empty_command_is_reported_inline() {
+        let (mut app, calls) = app_with_mutator(vec![task("a", TaskSourceKind::Cron)], vec![]);
+        app.handle_key(KeyCode::Char('a'));
+        app.handle_key(KeyCode::Tab);
+        app.handle_key(KeyCode::Tab);
+        type_text(&mut app, "*/5 * * * *");
+        app.handle_key(KeyCode::Enter);
+
+        assert_eq!(app.mode, Mode::Form, "a bad form stays open");
+        let form = app.form.as_ref().expect("form");
+        assert_eq!(form.error.as_deref(), Some("command must not be empty"));
+        assert!(!form.locked, "nothing is in flight, so keep typing");
+        assert!(app.busy.is_none());
+        assert_eq!(calls.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn submitting_the_form_plans_and_opens_the_confirm() {
+        let (mut app, calls) = app_with_mutator(
+            vec![task("a", TaskSourceKind::Cron)],
+            vec![Ok(plan_outcome())],
+        );
+        app.handle_key(KeyCode::Char('a'));
+        fill_cron_form(&mut app);
+        app.handle_key(KeyCode::Enter);
+
+        assert_eq!(app.busy, Some(Busy::Plan));
+        assert!(app.form.as_ref().unwrap().locked, "the spec cannot drift");
+        let (op, stage) = next_call(&calls);
+        assert_eq!(stage, Stage::Plan);
+        match &op {
+            Op::Create(spec) => {
+                assert_eq!(spec.command, "echo hi");
+                assert_eq!(spec.schedule, ScheduleType::Cron("*/5 * * * *".into()));
+            }
+            other => panic!("expected a create, got {other:?}"),
+        }
+
+        pump(&mut app);
+        assert_eq!(app.mode, Mode::Confirm);
+        assert!(app.busy.is_none());
+        assert!(app.form.is_none(), "the form is replaced by the plan");
+        assert_eq!(app.pending.as_ref().unwrap().plan, Some(plan_outcome()));
+    }
+
+    #[test]
+    fn y_applies_and_then_asks_for_a_refresh() {
+        let applied = MutationOutcome {
+            applied: true,
+            ..plan_outcome()
+        };
+        let (mut app, calls) = app_with_mutator(
+            vec![task("a", TaskSourceKind::Cron)],
+            vec![Ok(plan_outcome()), Ok(applied)],
+        );
+        app.handle_key(KeyCode::Char('d'));
+        pump(&mut app);
+        assert_eq!(app.mode, Mode::Confirm);
+        assert_eq!(next_call(&calls).1, Stage::Plan);
+
+        app.handle_key(KeyCode::Char('y'));
+        assert_eq!(app.busy, Some(Busy::Apply));
+        assert_eq!(next_call(&calls).1, Stage::Apply);
+        pump(&mut app);
+
+        assert_eq!(app.mode, Mode::Normal);
+        let notice = app.notice.as_ref().expect("notice");
+        assert_eq!(notice.text, "removed user:alice:4");
+        assert!(!notice.is_error);
+        assert!(app.pending.is_none());
+        assert_eq!(
+            app.busy,
+            Some(Busy::Refresh),
+            "the rows on screen are now stale"
+        );
+    }
+
+    #[test]
+    fn n_cancels_a_confirmed_plan() {
+        let (mut app, calls) = app_with_mutator(
+            vec![task("a", TaskSourceKind::Cron)],
+            vec![Ok(plan_outcome())],
+        );
+        app.handle_key(KeyCode::Char('d'));
+        pump(&mut app);
+        assert_eq!(app.mode, Mode::Confirm);
+        next_call(&calls);
+
+        app.handle_key(KeyCode::Char('n'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.pending.is_none());
+        assert!(app.busy.is_none());
+        assert_eq!(calls.try_recv(), Err(TryRecvError::Empty), "no apply");
+    }
+
+    #[test]
+    fn a_dry_run_confirm_never_applies() {
+        let (mut app, calls) = app_with_mutator_opts(
+            vec![task("a", TaskSourceKind::Cron)],
+            vec![Ok(plan_outcome())],
+            true,
+        );
+        app.handle_key(KeyCode::Char('d'));
+        pump(&mut app);
+        next_call(&calls);
+
+        app.handle_key(KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.notice.as_ref().unwrap().text, "dry run: not applied");
+        assert!(app.busy.is_none());
+        assert_eq!(calls.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn d_plans_a_delete_of_the_selected_row() {
+        let mut row = task("backup", TaskSourceKind::Cron);
+        row.id = "user:alice:4".into();
+        let (mut app, calls) = app_with_mutator(vec![row], vec![Ok(plan_outcome())]);
+        app.handle_key(KeyCode::Char('d'));
+        assert_eq!(
+            next_call(&calls),
+            (
+                Op::Delete {
+                    id: "user:alice:4".into(),
+                    source: TaskSourceKind::Cron
+                },
+                Stage::Plan
+            )
+        );
+    }
+
+    #[test]
+    fn t_flips_the_enabled_flag_of_the_selected_row() {
+        let mut off = task("backup", TaskSourceKind::Systemd);
+        off.id = "user/backup.timer".into();
+        off.enabled = Some(false);
+        let (mut app, calls) = app_with_mutator(vec![off], vec![Ok(plan_outcome())]);
+        app.handle_key(KeyCode::Char('t'));
+        assert_eq!(
+            next_call(&calls),
+            (
+                Op::SetEnabled {
+                    id: "user/backup.timer".into(),
+                    source: TaskSourceKind::Systemd,
+                    enabled: true
+                },
+                Stage::Plan
+            )
+        );
+
+        // An unknown state is treated as on, so `t` turns it off.
+        let (mut app, calls) = app_with_mutator(
+            vec![task("alpha", TaskSourceKind::Cron)],
+            vec![Ok(plan_outcome())],
+        );
+        app.handle_key(KeyCode::Char('t'));
+        assert_eq!(
+            next_call(&calls).0,
+            Op::SetEnabled {
+                id: "alpha".into(),
+                source: TaskSourceKind::Cron,
+                enabled: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_plan_failure_returns_to_the_open_form() {
+        let (mut app, _calls) = app_with_mutator(
+            vec![task("a", TaskSourceKind::Cron)],
+            vec![Err(anyhow::anyhow!("cron: bad expression\ndetail"))],
+        );
+        app.handle_key(KeyCode::Char('a'));
+        fill_cron_form(&mut app);
+        app.handle_key(KeyCode::Enter);
+        pump(&mut app);
+
+        assert_eq!(app.mode, Mode::Form);
+        let form = app.form.as_ref().expect("form still open");
+        assert_eq!(form.error.as_deref(), Some("cron: bad expression"));
+        assert!(!form.locked, "the operator can fix the field");
+        assert_eq!(form.command.value, "echo hi", "what was typed survives");
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn a_plan_failure_without_a_form_becomes_a_notice() {
+        let (mut app, _calls) = app_with_mutator(
+            vec![task("a", TaskSourceKind::Cron)],
+            vec![Err(anyhow::anyhow!("needs root: pass --sudo"))],
+        );
+        app.handle_key(KeyCode::Char('d'));
+        pump(&mut app);
+        assert_eq!(app.mode, Mode::Normal);
+        let notice = app.notice.as_ref().expect("notice");
+        assert!(notice.is_error);
+        assert_eq!(notice.text, "needs root: pass --sudo");
+    }
+
+    #[test]
+    fn an_apply_failure_keeps_the_rows_and_reports_it() {
+        let (mut app, _calls) = app_with_mutator(
+            vec![task("alpha", TaskSourceKind::Cron)],
+            vec![Ok(plan_outcome()), Err(anyhow::anyhow!("write failed"))],
+        );
+        app.handle_key(KeyCode::Char('d'));
+        pump(&mut app);
+        app.handle_key(KeyCode::Char('y'));
+        pump(&mut app);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.notice.as_ref().unwrap().is_error);
+        assert_eq!(app.notice.as_ref().unwrap().text, "write failed");
+        assert_eq!(app.visible.len(), 1, "the table is untouched");
+        assert_eq!(app.visible[0].name, "alpha");
+        assert!(app.busy.is_none(), "a failure asks for no refresh");
+    }
+
+    #[test]
+    fn mutation_keys_are_ignored_while_a_request_is_in_flight() {
+        let (mut app, calls) = app_with_mutator(
+            vec![task("a", TaskSourceKind::Cron)],
+            vec![Ok(plan_outcome())],
+        );
+        app.handle_key(KeyCode::Char('d'));
+        assert_eq!(app.busy, Some(Busy::Plan));
+
+        for code in ['a', 'e', 'd', 't', 'r'] {
+            app.handle_key(KeyCode::Char(code));
+        }
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.form.is_none());
+        assert_eq!(app.busy, Some(Busy::Plan), "still the same request");
+        next_call(&calls);
+        assert_eq!(
+            calls.try_recv(),
+            Err(TryRecvError::Empty),
+            "nothing was queued behind it"
+        );
+    }
+
+    #[test]
+    fn the_detail_pane_lists_id_enabled_and_location() {
+        let mut row = task("backup", TaskSourceKind::Systemd);
+        row.id = "user/backup.timer".into();
+        row.enabled = Some(false);
+        row.location = Some("/home/alice/.config/systemd/user/backup.timer".into());
+        let rendered: Vec<String> = format_detail(&row, at(0)).iter().map(line_text).collect();
+        assert!(rendered.iter().any(|l| l.contains("user/backup.timer")));
+        assert!(rendered
+            .iter()
+            .any(|l| l.starts_with("Enabled") && l.ends_with("no")));
+        assert!(rendered.iter().any(|l| l.starts_with("Location")
+            && l.contains("/home/alice/.config/systemd/user/backup.timer")));
+
+        let plain = task("alpha", TaskSourceKind::Cron);
+        let rendered: Vec<String> = format_detail(&plain, at(0)).iter().map(line_text).collect();
+        assert!(rendered
+            .iter()
+            .any(|l| l.starts_with("Enabled") && l.ends_with('-')));
+        assert!(
+            !rendered.iter().any(|l| l.starts_with("Location")),
+            "no backing file, no row"
+        );
+    }
+
+    #[test]
+    fn the_confirm_body_shows_the_changed_lines_and_the_notes() {
+        let outcome = MutationOutcome {
+            id: None,
+            changes: vec![
+                Change::WriteFile {
+                    path: "/etc/cron.d/x".into(),
+                    before: Some("keep\ndrop\n".into()),
+                    after: "keep\nadd\n".into(),
+                    mode: 0o644,
+                    privilege: Privilege::Root,
+                },
+                Change::RemoveFile {
+                    path: "/etc/cron.d/y".into(),
+                    before: Some("gone\n".into()),
+                    privilege: Privilege::Root,
+                },
+                Change::Command {
+                    cmd: "systemctl daemon-reload".into(),
+                    stdin: None,
+                    privilege: Privilege::Root,
+                    description: "reload".into(),
+                    on_fail: shuvjobs_core::FailPolicy::Error,
+                },
+            ],
+            applied: false,
+            outputs: Vec::new(),
+            notes: vec!["line moved".into()],
+        };
+        assert_eq!(
+            render_outcome(&outcome),
+            vec![
+                "write /etc/cron.d/x",
+                "-drop",
+                "+add",
+                "remove /etc/cron.d/y",
+                "-gone",
+                "run systemctl daemon-reload",
+                "notes:",
+                "  line moved",
+            ]
+        );
+        assert!(render_outcome(&MutationOutcome::default()).is_empty());
+    }
+
+    #[test]
+    fn the_confirm_title_names_the_job() {
+        assert_eq!(
+            confirm_title(&Op::Delete {
+                id: "user:alice:4".into(),
+                source: TaskSourceKind::Cron
+            }),
+            "rm cron user:alice:4"
+        );
+        assert_eq!(
+            confirm_title(&Op::Create(shuvjobs_core::JobSpec::new(
+                TaskSourceKind::At,
+                ScheduleType::Calendar("now + 1 hour".into()),
+                "echo hi".into()
+            ))),
+            "add at (new)"
         );
     }
 }
