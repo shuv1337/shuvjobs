@@ -23,4 +23,7 @@
 - Keep the SSH multiplex master alive across `--refresh` cycles instead of
   tearing it down after every collection.
 - Stop capturing the mouse in the TUI so terminal text selection works.
+- Render absolute timestamps in the TUI (detail pane last/next run, one-shot
+  schedules, and the far-future date fallback) in the local timezone with the
+  offset shown, instead of UTC.
 - Verify the declared minimum Rust version in CI.

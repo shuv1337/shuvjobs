@@ -7,7 +7,7 @@ use std::io;
 use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -25,6 +25,13 @@ use shuvjobs_core::{
     view::{apply, Filter, SortMode},
     ScheduleType, ScheduledTask, TaskSourceKind, TaskStatus,
 };
+
+/// Detail-pane absolute stamp: local wall clock plus the zone offset, so a
+/// timestamp is never ambiguous when read on another machine.
+const ABSOLUTE_FMT: &str = "%Y-%m-%d %H:%M:%S %Z";
+/// One-shot schedules are shown in table cells too, so they stay compact.
+const ONE_SHOT_FMT: &str = "%Y-%m-%d %H:%M %Z";
+const DATE_FMT: &str = "%Y-%m-%d";
 
 /// `initial` is the first paint. If `refresh_secs` is set the TUI calls
 /// `refresh` on that interval to re-collect tasks.
@@ -544,15 +551,25 @@ fn kv(label: &str, value: &str) -> Line<'static> {
     ])
 }
 
-fn format_dt_with_relative(dt: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+/// Absolute timestamps are rendered in `tz` so the pane matches the wall clock
+/// the user schedules against; the relative half stays zone-independent.
+fn format_dt_with_relative_in<Tz>(dt: Option<DateTime<Utc>>, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz: TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
     match dt {
         None => "-".into(),
         Some(dt) => format!(
             "{} ({})",
-            format_relative(dt, now),
-            dt.format("%Y-%m-%d %H:%M:%S UTC")
+            format_relative_in(dt, now, tz),
+            dt.with_timezone(tz).format(ABSOLUTE_FMT)
         ),
     }
+}
+
+fn format_dt_with_relative(dt: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    format_dt_with_relative_in(dt, now, &Local)
 }
 
 fn format_status_long(s: Option<&TaskStatus>) -> String {
@@ -654,14 +671,22 @@ fn format_source(kind: TaskSourceKind) -> &'static str {
     kind.as_str()
 }
 
-fn format_schedule(s: &ScheduleType) -> String {
+fn format_schedule_in<Tz>(s: &ScheduleType, tz: &Tz) -> String
+where
+    Tz: TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
     match s {
         ScheduleType::Cron(expr) => expr.clone(),
         ScheduleType::Calendar(expr) if expr.is_empty() => "(unknown)".into(),
         ScheduleType::Calendar(expr) => expr.clone(),
         ScheduleType::Interval(d) => format!("every {}", human_duration(*d)),
-        ScheduleType::OneShot(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        ScheduleType::OneShot(dt) => dt.with_timezone(tz).format(ONE_SHOT_FMT).to_string(),
     }
+}
+
+fn format_schedule(s: &ScheduleType) -> String {
+    format_schedule_in(s, &Local)
 }
 
 fn format_status(s: Option<&TaskStatus>) -> &'static str {
@@ -673,20 +698,34 @@ fn format_status(s: Option<&TaskStatus>) -> &'static str {
     }
 }
 
-fn format_optional_dt(dt: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+fn format_optional_dt_in<Tz>(dt: Option<DateTime<Utc>>, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz: TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
     match dt {
-        Some(dt) => format_relative(dt, now),
+        Some(dt) => format_relative_in(dt, now, tz),
         None => "-".to_string(),
     }
 }
 
-fn format_relative(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
+fn format_optional_dt(dt: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
+    format_optional_dt_in(dt, now, &Local)
+}
+
+/// Only the far-future/far-past fallback is zone-sensitive: it degrades to a
+/// calendar date, which has to be the date in `tz`.
+fn format_relative_in<Tz>(dt: DateTime<Utc>, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz: TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
     let delta = dt.signed_duration_since(now);
     let abs = delta.num_seconds().unsigned_abs();
     let in_future = delta.num_seconds() >= 0;
 
     if abs >= 30 * 86_400 {
-        return dt.format("%Y-%m-%d").to_string();
+        return dt.with_timezone(tz).format(DATE_FMT).to_string();
     }
 
     let label = if abs < 60 {
@@ -722,11 +761,22 @@ fn human_duration(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::FixedOffset;
     use std::time::Duration;
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).single().unwrap()
+    }
+
+    /// UTC+02:00 — deterministic stand-in for `Local` in formatting tests.
+    fn plus_two() -> FixedOffset {
+        FixedOffset::east_opt(2 * 3_600).unwrap()
+    }
+
+    /// UTC-08:00, far enough west to push a late-evening UTC stamp onto the
+    /// previous calendar day.
+    fn minus_eight() -> FixedOffset {
+        FixedOffset::west_opt(8 * 3_600).unwrap()
     }
 
     fn task(name: &str, source: TaskSourceKind) -> ScheduledTask {
@@ -746,11 +796,20 @@ mod tests {
     #[test]
     fn relative_times_scale_by_magnitude() {
         let now = at(1_000_000);
-        assert_eq!(format_relative(at(1_000_030), now), "in 30s");
-        assert_eq!(format_relative(at(1_000_000 - 90), now), "1m ago");
-        assert_eq!(format_relative(at(1_000_000 + 7_200), now), "in 2h");
-        assert_eq!(format_relative(at(1_000_000 - 3 * 86_400), now), "3d ago");
-        assert_eq!(format_relative(now, now), "in 0s");
+        let tz = plus_two();
+        assert_eq!(format_relative_in(at(1_000_030), now, &tz), "in 30s");
+        assert_eq!(format_relative_in(at(1_000_000 - 90), now, &tz), "1m ago");
+        assert_eq!(format_relative_in(at(1_000_000 + 7_200), now, &tz), "in 2h");
+        assert_eq!(
+            format_relative_in(at(1_000_000 - 3 * 86_400), now, &tz),
+            "3d ago"
+        );
+        assert_eq!(format_relative_in(now, now, &tz), "in 0s");
+        assert_eq!(
+            format_relative_in(at(1_000_030), now, &minus_eight()),
+            "in 30s",
+            "relative strings do not depend on the zone"
+        );
     }
 
     #[test]
@@ -758,14 +817,52 @@ mod tests {
         let now = at(1_000_000);
         let far = now + chrono::Duration::days(45);
         assert_eq!(
-            format_relative(far, now),
+            format_relative_in(far, now, &Utc),
             far.format("%Y-%m-%d").to_string()
         );
     }
 
     #[test]
+    fn far_future_date_fallback_uses_the_target_zone() {
+        // 2026-04-14 04:00 UTC is still 2026-04-13 in UTC-08:00.
+        let far = at(1_776_139_200);
+        let now = far - chrono::Duration::days(45);
+        assert_eq!(format_relative_in(far, now, &Utc), "2026-04-14");
+        assert_eq!(format_relative_in(far, now, &minus_eight()), "2026-04-13");
+    }
+
+    #[test]
+    fn absolute_timestamps_render_in_the_target_zone() {
+        let now = at(1_776_175_200);
+        let last = Some(at(1_776_175_200 - 3_600));
+        assert_eq!(
+            format_dt_with_relative_in(last, now, &Utc),
+            "1h ago (2026-04-14 13:00:00 UTC)"
+        );
+        assert_eq!(
+            format_dt_with_relative_in(last, now, &plus_two()),
+            "1h ago (2026-04-14 15:00:00 +02:00)"
+        );
+        assert_eq!(
+            format_dt_with_relative_in(last, now, &minus_eight()),
+            "1h ago (2026-04-14 05:00:00 -08:00)"
+        );
+        assert_eq!(format_dt_with_relative_in(None, now, &plus_two()), "-");
+    }
+
+    #[test]
+    fn one_shot_schedule_renders_in_the_target_zone() {
+        let one_shot = ScheduleType::OneShot(at(1_776_175_200));
+        assert_eq!(format_schedule_in(&one_shot, &Utc), "2026-04-14 14:00 UTC");
+        assert_eq!(
+            format_schedule_in(&one_shot, &minus_eight()),
+            "2026-04-14 06:00 -08:00"
+        );
+    }
+
+    #[test]
     fn optional_datetime_renders_dash_for_none() {
-        assert_eq!(format_optional_dt(None, at(0)), "-");
+        assert_eq!(format_optional_dt_in(None, at(0), &plus_two()), "-");
     }
 
     #[test]
@@ -780,24 +877,24 @@ mod tests {
     #[test]
     fn schedule_formatting_covers_every_variant() {
         assert_eq!(
-            format_schedule(&ScheduleType::Cron("0 2 * * *".into())),
+            format_schedule_in(&ScheduleType::Cron("0 2 * * *".into()), &Utc),
             "0 2 * * *"
         );
         assert_eq!(
-            format_schedule(&ScheduleType::Calendar(String::new())),
+            format_schedule_in(&ScheduleType::Calendar(String::new()), &Utc),
             "(unknown)"
         );
         assert_eq!(
-            format_schedule(&ScheduleType::Calendar("daily".into())),
+            format_schedule_in(&ScheduleType::Calendar("daily".into()), &Utc),
             "daily"
         );
         assert_eq!(
-            format_schedule(&ScheduleType::Interval(Duration::from_secs(3_600))),
+            format_schedule_in(&ScheduleType::Interval(Duration::from_secs(3_600)), &Utc),
             "every 1h"
         );
         assert_eq!(
-            format_schedule(&ScheduleType::OneShot(at(1_776_175_200))),
-            "2026-04-14 14:00"
+            format_schedule_in(&ScheduleType::OneShot(at(1_776_175_200)), &Utc),
+            "2026-04-14 14:00 UTC"
         );
     }
 

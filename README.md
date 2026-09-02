@@ -37,6 +37,7 @@ hand, and reconciling the differences.
 - Live filter by source kind
 - Sort by next run, last run, name, or status
 - Detail pane with the full command, schedule expression, last status, and run duration
+- Absolute timestamps in your local timezone, with the UTC offset spelled out
 - Substring search across name and command
 - Auto-refresh on a configurable interval
 - Remote-host mode over SSH — no binary upload, runs the host's own commands
