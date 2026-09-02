@@ -6,8 +6,27 @@
 //! name, and sometimes a shell word, so it has to be safe in all three.
 
 pub mod calendar;
+pub mod cron;
 
-use shuvjobs_core::{Error, Result};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use shuvjobs_core::host::Host;
+use shuvjobs_core::manage::JobWriter;
+use shuvjobs_core::{Error, Result, TaskSourceKind};
+
+/// Every writer this build knows about, keyed by the source they write.
+///
+/// One `Arc<dyn Host>` is shared by all of them, so a session over SSH
+/// keeps exactly one multiplex master however many sources it touches.
+pub fn writers_for(host: Arc<dyn Host>) -> HashMap<TaskSourceKind, Box<dyn JobWriter>> {
+    let mut writers: HashMap<TaskSourceKind, Box<dyn JobWriter>> = HashMap::new();
+    writers.insert(
+        TaskSourceKind::Cron,
+        Box::new(cron::CronWriter::new(Arc::clone(&host))),
+    );
+    writers
+}
 
 /// Prefix that turns a job line into a comment we can find again.
 ///
@@ -117,6 +136,16 @@ pub fn validate_simple_name(name: &str, kind: NameKind) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_registry_keys_every_writer_by_its_own_source() {
+        let host: Arc<dyn Host> = Arc::new(shuvjobs_core::host::FakeHost::new());
+        let writers = writers_for(host);
+        assert!(!writers.is_empty());
+        for (kind, writer) in &writers {
+            assert_eq!(*kind, writer.kind());
+        }
+    }
 
     #[test]
     fn markers_are_pinned() {

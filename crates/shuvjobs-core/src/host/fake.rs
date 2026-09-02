@@ -15,6 +15,14 @@ use chrono::FixedOffset;
 use super::{privileged_command, CmdOutput, Host, HostOs, Privilege, PrivilegePolicy};
 use crate::{Error, Result};
 
+fn output(code: i32, stdout: &str, stderr: &str) -> CmdOutput {
+    CmdOutput {
+        code: Some(code),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.to_string(),
+    }
+}
+
 /// One recorded [`Host::run`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {
@@ -28,6 +36,9 @@ struct State {
     /// path -> (contents, mode)
     files: BTreeMap<String, (Vec<u8>, u32)>,
     calls: Vec<Call>,
+    /// How many times each command has run, so a queued script can hand
+    /// out a different answer the second time round.
+    runs: BTreeMap<String, usize>,
 }
 
 /// Builder-configured fake host. Cheap to clone-free share: every method
@@ -36,7 +47,9 @@ struct State {
 pub struct FakeHost {
     policy: PrivilegePolicy,
     root_only: Vec<String>,
-    scripts: BTreeMap<String, CmdOutput>,
+    os: HostOs,
+    /// Responses per command, consumed in order; the last one repeats.
+    scripts: BTreeMap<String, Vec<CmdOutput>>,
     default_output: CmdOutput,
     state: Mutex<State>,
 }
@@ -52,6 +65,7 @@ impl FakeHost {
         Self {
             policy: PrivilegePolicy::default(),
             root_only: Vec::new(),
+            os: HostOs::Linux,
             scripts: BTreeMap::new(),
             default_output: CmdOutput {
                 // Unscripted commands look like a missing binary, so a
@@ -67,6 +81,11 @@ impl FakeHost {
 
     pub fn with_policy(mut self, policy: PrivilegePolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    pub fn with_os(mut self, os: HostOs) -> Self {
+        self.os = os;
         self
     }
 
@@ -88,14 +107,20 @@ impl FakeHost {
     }
 
     pub fn script(mut self, cmd: &str, code: i32, stdout: &str, stderr: &str) -> Self {
-        self.scripts.insert(
-            cmd.to_string(),
-            CmdOutput {
-                code: Some(code),
-                stdout: stdout.as_bytes().to_vec(),
-                stderr: stderr.to_string(),
-            },
-        );
+        self.scripts
+            .insert(cmd.to_string(), vec![output(code, stdout, stderr)]);
+        self
+    }
+
+    /// Queue a further response for `cmd`. A writer that re-reads what it
+    /// just wrote — `crontab -l` after `crontab -` — sees the new state
+    /// on the second call, and the last queued response repeats after
+    /// that.
+    pub fn then_script(mut self, cmd: &str, code: i32, stdout: &str, stderr: &str) -> Self {
+        self.scripts
+            .entry(cmd.to_string())
+            .or_default()
+            .push(output(code, stdout, stderr));
         self
     }
 
@@ -159,7 +184,7 @@ impl Host for FakeHost {
     }
 
     fn os(&self) -> Result<HostOs> {
-        Ok(HostOs::Linux)
+        Ok(self.os)
     }
 
     fn utc_offset(&self) -> Result<FixedOffset> {
@@ -170,16 +195,22 @@ impl Host for FakeHost {
         // Consulted for its refusal only: what we record is the plain
         // command, not the sudo-wrapped rendering.
         privileged_command(cmd, privilege, self.policy, cmd)?;
-        self.lock().calls.push(Call {
-            cmd: cmd.to_string(),
-            stdin: stdin.map(|b| b.to_vec()),
-            privilege,
-        });
-        Ok(self
-            .scripts
-            .get(cmd)
-            .cloned()
-            .unwrap_or_else(|| self.default_output.clone()))
+        let nth = {
+            let mut state = self.lock();
+            state.calls.push(Call {
+                cmd: cmd.to_string(),
+                stdin: stdin.map(|b| b.to_vec()),
+                privilege,
+            });
+            let seen = state.runs.entry(cmd.to_string()).or_insert(0);
+            let nth = *seen;
+            *seen += 1;
+            nth
+        };
+        let Some(queued) = self.scripts.get(cmd) else {
+            return Ok(self.default_output.clone());
+        };
+        Ok(queued[nth.min(queued.len() - 1)].clone())
     }
 
     fn read_file(&self, path: &str, privilege: Privilege) -> Result<Option<Vec<u8>>> {
@@ -356,6 +387,30 @@ mod tests {
             .expect_err("must refuse");
         assert!(matches!(err, Error::NeedsRoot { .. }), "got {err:?}");
         assert!(host.calls().is_empty());
+    }
+
+    #[test]
+    fn queued_scripts_are_handed_out_in_order_then_repeat() {
+        let host = FakeHost::new()
+            .script("crontab -l", 0, "first\n", "")
+            .then_script("crontab -l", 0, "second\n", "");
+        let read = || {
+            host.run("crontab -l", None, Privilege::User)
+                .unwrap()
+                .stdout_str()
+                .into_owned()
+        };
+        assert_eq!(read(), "first\n");
+        assert_eq!(read(), "second\n");
+        assert_eq!(read(), "second\n");
+    }
+
+    #[test]
+    fn the_os_is_configurable() {
+        assert_eq!(
+            FakeHost::new().with_os(HostOs::MacOs).os().unwrap(),
+            HostOs::MacOs
+        );
     }
 
     #[test]
