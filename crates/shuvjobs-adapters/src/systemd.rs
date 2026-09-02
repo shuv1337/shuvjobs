@@ -1,14 +1,18 @@
 //! systemd `*.timer` adapter.
 //!
 //! `systemctl list-timers` gives us the next/last instants and the bound
-//! service. We then `systemctl show` each timer for `OnCalendar=` /
-//! `OnUnitActiveSec=` and the bound service for `ExecStart=`, `Result=`,
-//! `ActiveState=`/`SubState=`, and the main-process timestamps.
+//! service. We then `systemctl show` the timers for `OnCalendar=` /
+//! `OnUnitActiveSec=` and the bound services for `ExecStart=`, `Result=`,
+//! `ActiveState=`/`SubState=`, and the main-process timestamps. Both
+//! `show` calls are batched: one invocation per property set per scope
+//! (chunked at [`SHOW_CHUNK_SIZE`] units), not one per unit. The reply is
+//! one block per unit separated by a blank line, keyed by `Id=`.
 //!
 //! Status deliberately comes from the *service*, not the timer: a timer
 //! unit's own `Result=` stays `success` even when every activation of
 //! the service it fires has failed.
 
+use std::collections::HashMap;
 use std::process::Command;
 use std::time::Duration;
 
@@ -22,7 +26,7 @@ use shuvjobs_core::{
 /// system manager by default and to the calling user's manager with
 /// `--user`; the two namespaces can hold identically named units, so the
 /// scope is part of a task's identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
     System,
     User,
@@ -192,6 +196,28 @@ impl SystemdAdapter {
         out
     }
 
+    /// Split a batched `systemctl show UNIT... --property=...` reply into
+    /// `(Id, block text)` pairs. systemd prints one block per requested
+    /// unit, separated by a blank line, and emits a block even for a unit
+    /// that does not exist (`Id=` plus the defaults). Keying by `Id=`
+    /// rather than by position means a missing, extra, or reordered block
+    /// can never be applied to the wrong task; a block without an `Id=`
+    /// is dropped.
+    pub fn parse_show_blocks(text: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut block = String::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                push_block(&mut out, &mut block);
+                continue;
+            }
+            block.push_str(line);
+            block.push('\n');
+        }
+        push_block(&mut out, &mut block);
+        out
+    }
+
     /// Merge `systemctl show <timer>` and `systemctl show <service>` output
     /// onto a task produced by [`SystemdAdapter::parse_list_timers`].
     /// Either input may be absent; the task keeps whatever it already had.
@@ -224,11 +250,68 @@ impl SystemdAdapter {
 
 /// Properties requested from the bound service. Kept in one place so the
 /// local adapter and the SSH bridge issue the identical `systemctl show`.
-pub const SERVICE_SHOW_PROPERTIES: &str = "ExecStart,Result,ActiveState,SubState,\
+pub const SERVICE_SHOW_PROPERTIES: &str = "Id,ExecStart,Result,ActiveState,SubState,\
 ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic";
 
 /// Properties requested from the timer unit itself.
-pub const TIMER_SHOW_PROPERTIES: &str = "TimersCalendar,TimersMonotonic,Result";
+pub const TIMER_SHOW_PROPERTIES: &str = "Id,TimersCalendar,TimersMonotonic,Result";
+
+/// Upper bound on units passed to a single `systemctl show`. Batching is
+/// the whole point, but an unbounded argv would eventually hit `ARG_MAX`
+/// (locally) or the remote shell's command-line limit over SSH.
+pub const SHOW_CHUNK_SIZE: usize = 64;
+
+/// Units to query per scope for a batch of listed timers, as
+/// `(scope, timer units, service units)`. Both lists are sorted and
+/// deduplicated, and scopes with no timers are omitted, so callers can
+/// map straight onto one `systemctl show` per list.
+pub fn show_unit_groups(tasks: &[ScheduledTask]) -> Vec<(Scope, Vec<String>, Vec<String>)> {
+    let mut groups = Vec::new();
+    for scope in [Scope::System, Scope::User] {
+        let mut timers = Vec::new();
+        let mut services = Vec::new();
+        for task in tasks {
+            let (task_scope, unit) = split_task_id(&task.id);
+            if task_scope != scope {
+                continue;
+            }
+            timers.push(unit.to_string());
+            if !task.command.is_empty() {
+                services.push(task.command.clone());
+            }
+        }
+        if timers.is_empty() {
+            continue;
+        }
+        sort_dedup(&mut timers);
+        sort_dedup(&mut services);
+        groups.push((scope, timers, services));
+    }
+    groups
+}
+
+fn sort_dedup(units: &mut Vec<String>) {
+    units.sort();
+    units.dedup();
+}
+
+/// Flush one accumulated `systemctl show` block, keyed by its `Id=`.
+fn push_block(out: &mut Vec<(String, String)>, block: &mut String) {
+    if block.is_empty() {
+        return;
+    }
+    let id = block
+        .lines()
+        .find_map(|l| l.strip_prefix("Id="))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    if let Some(id) = id {
+        out.push((id, std::mem::take(block)));
+    } else {
+        block.clear();
+    }
+}
 
 /// Service state wins; the timer's own `Result=` is only a fallback when
 /// we could not inspect the service at all. A service that has never
@@ -299,16 +382,26 @@ impl TaskSource for SystemdAdapter {
             }
         }
 
-        for task in &mut tasks {
-            let (scope, unit) = split_task_id(&task.id);
-            let timer_text = run_show(scope, unit, TIMER_SHOW_PROPERTIES);
-            let service = task.command.clone();
-            let service_text = if service.is_empty() {
-                None
-            } else {
-                run_show(scope, &service, SERVICE_SHOW_PROPERTIES)
-            };
-            Self::apply_show(task, timer_text.as_deref(), service_text.as_deref());
+        // One `systemctl show` per property set per scope instead of two
+        // spawns per timer. A unit with no block in the reply keeps
+        // whatever `list-timers` gave it, exactly as before.
+        for (scope, timer_units, service_units) in show_unit_groups(&tasks) {
+            let timer_blocks = run_show_batch(scope, &timer_units, TIMER_SHOW_PROPERTIES);
+            let service_blocks = run_show_batch(scope, &service_units, SERVICE_SHOW_PROPERTIES);
+            for task in &mut tasks {
+                let id = task.id.clone();
+                let (task_scope, unit) = split_task_id(&id);
+                if task_scope != scope {
+                    continue;
+                }
+                let timer_text = timer_blocks.get(unit);
+                let service_text = service_blocks.get(&task.command);
+                Self::apply_show(
+                    task,
+                    timer_text.map(String::as_str),
+                    service_text.map(String::as_str),
+                );
+            }
         }
 
         Ok(tasks)
@@ -368,11 +461,29 @@ impl ShowService {
     }
 }
 
-fn run_show(scope: Scope, unit: &str, properties: &str) -> Option<String> {
+/// `systemctl [--user] show <units...> --property=<properties>` in
+/// chunks, parsed into `Id` → block text. Chunks that fail contribute
+/// nothing, so their tasks keep their `list-timers` data.
+fn run_show_batch(scope: Scope, units: &[String], properties: &str) -> HashMap<String, String> {
+    let mut blocks = HashMap::new();
+    for chunk in units.chunks(SHOW_CHUNK_SIZE) {
+        if let Some(text) = run_show_chunk(scope, chunk, properties) {
+            blocks.extend(SystemdAdapter::parse_show_blocks(&text));
+        }
+    }
+    blocks
+}
+
+fn run_show_chunk(scope: Scope, units: &[String], properties: &str) -> Option<String> {
+    if units.is_empty() {
+        return None;
+    }
     let prop_arg = format!("--property={properties}");
     let out = Command::new("systemctl")
         .args(scope.systemctl_args())
-        .args(["show", unit, &prop_arg, "--no-pager"])
+        .arg("show")
+        .args(units)
+        .args([&prop_arg, "--no-pager"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -791,6 +902,164 @@ ExecMainExitTimestampMonotonic=40202376368
     fn scope_supplies_the_user_flag() {
         assert!(Scope::System.systemctl_args().is_empty());
         assert_eq!(Scope::User.systemctl_args(), ["--user"]);
+    }
+
+    // Captured verbatim from
+    //   systemctl show logrotate.timer nonexistent-thing.timer man-db.timer \
+    //     --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager
+    // on an Arch host. Note the middle unit does not exist: systemd still
+    // emits a block for it, with `Id=` and property defaults, and exits 0.
+    const SHOW_BLOCKS_TIMERS: &str = "\
+Id=logrotate.timer
+Result=success
+
+Id=nonexistent-thing.timer
+Result=success
+
+Id=man-db.timer
+TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Wed 2026-09-02 00:00:00 PDT }
+Result=success
+";
+
+    // Same host:
+    //   systemctl show logrotate.service man-db.service --property=Id,ExecStart,...
+    // man-db.service carries two ExecStart lines; only the first is used.
+    const SHOW_BLOCKS_SERVICES: &str = "\
+Id=logrotate.service
+ActiveState=inactive
+SubState=dead
+Result=success
+ExecMainStartTimestampMonotonic=0
+ExecMainExitTimestampMonotonic=0
+
+Id=man-db.service
+ActiveState=inactive
+SubState=dead
+Result=success
+ExecMainStartTimestampMonotonic=0
+ExecMainExitTimestampMonotonic=0
+ExecStart={ path=/usr/bin/install ; argv[]=/usr/bin/install -d -o root -g root -m 0755 /var/cache/man ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+ExecStart={ path=/usr/bin/mandb ; argv[]=/usr/bin/mandb --quiet ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+";
+
+    #[test]
+    fn parse_show_blocks_keys_timer_blocks_by_id() {
+        let blocks = SystemdAdapter::parse_show_blocks(SHOW_BLOCKS_TIMERS);
+        let ids: Vec<&str> = blocks.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["logrotate.timer", "nonexistent-thing.timer", "man-db.timer"]
+        );
+        let map: HashMap<String, String> = blocks.into_iter().collect();
+        let man_db = SystemdAdapter::parse_show_timer(&map["man-db.timer"]);
+        assert_eq!(man_db.on_calendar.as_deref(), Some("*-*-* 00:00:00"));
+        assert_eq!(man_db.result.as_deref(), Some("success"));
+        // The unit that does not exist still yields a parseable block with
+        // no schedule at all.
+        let missing = SystemdAdapter::parse_show_timer(&map["nonexistent-thing.timer"]);
+        assert!(missing.on_calendar.is_none());
+        assert!(missing.on_interval.is_none());
+    }
+
+    /// The final block has no trailing blank line; it must not be dropped.
+    #[test]
+    fn parse_show_blocks_keeps_the_last_block() {
+        let blocks = SystemdAdapter::parse_show_blocks(SHOW_BLOCKS_SERVICES);
+        assert_eq!(blocks.len(), 2);
+        let map: HashMap<String, String> = blocks.into_iter().collect();
+        let man_db = SystemdAdapter::parse_show_service(&map["man-db.service"]);
+        assert_eq!(
+            man_db.exec_start.as_deref(),
+            Some("/usr/bin/install -d -o root -g root -m 0755 /var/cache/man")
+        );
+        assert_eq!(man_db.active_state.as_deref(), Some("inactive"));
+        let logrotate = SystemdAdapter::parse_show_service(&map["logrotate.service"]);
+        assert!(logrotate.exec_start.is_none());
+        assert!(logrotate.main_duration().is_none());
+    }
+
+    #[test]
+    fn parse_show_blocks_returns_nothing_for_empty_input() {
+        assert!(SystemdAdapter::parse_show_blocks("").is_empty());
+        assert!(SystemdAdapter::parse_show_blocks("\n\n").is_empty());
+    }
+
+    /// Without an `Id=` there is nothing to key on, so the block is
+    /// dropped rather than guessed at by position.
+    #[test]
+    fn parse_show_blocks_drops_blocks_without_an_id() {
+        let text = "Result=success\n\nId=man-db.timer\nResult=success\n";
+        let blocks = SystemdAdapter::parse_show_blocks(text);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, "man-db.timer");
+    }
+
+    #[test]
+    fn parse_show_blocks_handles_a_single_unit_reply() {
+        let blocks = SystemdAdapter::parse_show_blocks("Id=man-db.timer\nResult=success\n");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].1, "Id=man-db.timer\nResult=success\n");
+    }
+
+    fn scoped_task(id: &str, command: &str) -> ScheduledTask {
+        let (scope, unit) = split_task_id(id);
+        ScheduledTask {
+            id: id.into(),
+            name: scope.task_name(unit),
+            source: TaskSourceKind::Systemd,
+            schedule: ScheduleType::Calendar(String::new()),
+            last_run: None,
+            last_status: None,
+            last_duration: None,
+            next_run: None,
+            command: command.into(),
+        }
+    }
+
+    #[test]
+    fn show_unit_groups_splits_scopes_and_drops_empty_commands() {
+        let tasks = vec![
+            scoped_task("logrotate.timer", "logrotate.service"),
+            scoped_task("man-db.timer", ""),
+            scoped_task("user/radar-daily.timer", "radar-daily.service"),
+        ];
+        let groups = show_unit_groups(&tasks);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, Scope::System);
+        assert_eq!(groups[0].1, ["logrotate.timer", "man-db.timer"]);
+        assert_eq!(groups[0].2, ["logrotate.service"]);
+        assert_eq!(groups[1].0, Scope::User);
+        assert_eq!(groups[1].1, ["radar-daily.timer"]);
+        assert_eq!(groups[1].2, ["radar-daily.service"]);
+    }
+
+    #[test]
+    fn show_unit_groups_deduplicates_shared_services() {
+        let tasks = vec![
+            scoped_task("b.timer", "shared.service"),
+            scoped_task("a.timer", "shared.service"),
+        ];
+        let groups = show_unit_groups(&tasks);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1, ["a.timer", "b.timer"]);
+        assert_eq!(groups[0].2, ["shared.service"]);
+    }
+
+    #[test]
+    fn show_unit_groups_omits_scopes_without_timers() {
+        assert!(show_unit_groups(&[]).is_empty());
+        let groups = show_unit_groups(&[scoped_task("user/radar-daily.timer", "")]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, Scope::User);
+        assert!(groups[0].2.is_empty());
+    }
+
+    /// Both property sets must ask for `Id`, or the batched reply cannot
+    /// be keyed at all.
+    #[test]
+    fn show_property_sets_request_id_first() {
+        assert!(TIMER_SHOW_PROPERTIES.starts_with("Id,"));
+        assert!(SERVICE_SHOW_PROPERTIES.starts_with("Id,"));
     }
 
     #[test]

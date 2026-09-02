@@ -40,4 +40,9 @@
   timers, locally and over SSH; user tasks get `user/`-prefixed ids and a
   `(user)` name suffix, and an unreachable user manager is skipped
   silently instead of failing the systemd source.
+- Batch the systemd `systemctl show` calls: one invocation per property
+  set per scope (chunked at 64 units) instead of two process spawns per
+  timer, locally and over SSH. Blocks are keyed by the unit's `Id=`, so a
+  missing or reordered block can never be applied to the wrong task.
+  Local `--json` collection on a 12-task host drops from ~46 ms to ~24 ms.
 - Verify the declared minimum Rust version in CI.

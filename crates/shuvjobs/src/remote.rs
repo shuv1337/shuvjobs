@@ -8,6 +8,7 @@
 //! `BatchMode=yes` makes us fail fast on missing key auth instead of
 //! hanging on a password prompt.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -18,7 +19,10 @@ use shuvjobs_adapters::{
     anacron::period_advance as anacron_period_advance,
     cron::crontab_list_args,
     launchd::LaunchctlEntry,
-    systemd::{split_task_id, Scope, SERVICE_SHOW_PROPERTIES, TIMER_SHOW_PROPERTIES},
+    systemd::{
+        show_unit_groups, split_task_id, Scope, SERVICE_SHOW_PROPERTIES, SHOW_CHUNK_SIZE,
+        TIMER_SHOW_PROPERTIES,
+    },
     AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter,
 };
 use shuvjobs_core::{ScheduledTask, TaskStatus};
@@ -236,11 +240,14 @@ impl Drop for RemoteCollector {
     }
 }
 
-fn systemctl_show_cmd(scope: Scope, unit: &str, properties: &str) -> String {
+/// One batched `systemctl show` for a chunk of units. The reply is one
+/// block per unit, keyed back to a unit by `Id=`.
+fn systemctl_show_cmd(scope: Scope, units: &[String], properties: &str) -> String {
+    let quoted: Vec<String> = units.iter().map(|u| shell_quote(u)).collect();
     format!(
         "systemctl{} show {} --property={properties} --no-pager",
         scope_flag(scope),
-        shell_quote(unit)
+        quoted.join(" ")
     )
 }
 
@@ -373,41 +380,87 @@ fn collect_systemd(
         }
     }
 
-    // Two `systemctl show` calls per timer, fanned out — 30 serial
-    // round-trips become ceil(N/8) waves of 8 in parallel.
-    let work: Vec<(String, String)> = tasks
-        .iter()
-        .map(|t| (t.id.clone(), t.command.clone()))
-        .collect();
+    // One batched `systemctl show` per property set per scope (chunked),
+    // instead of two round-trips per timer: 2N commands become
+    // 2 * ceil(N / SHOW_CHUNK_SIZE), still fanned out across the
+    // multiplexed connection.
+    let jobs = show_jobs(&tasks);
+    let outputs: Vec<Option<String>> = parallel_map(&jobs, REMOTE_PARALLELISM, |job| {
+        optional_remote_output(runner.run(&systemctl_show_cmd(
+            job.scope,
+            &job.units,
+            job.properties,
+        )))
+    })
+    .into_iter()
+    .collect::<std::result::Result<Vec<_>, RemoteSourceError>>()?;
 
-    let results: Vec<(Option<String>, Option<String>)> =
-        parallel_map(&work, REMOTE_PARALLELISM, |(unit_id, service)| {
-            let (scope, unit) = split_task_id(unit_id);
-            let timer_text = optional_remote_output(runner.run(&systemctl_show_cmd(
-                scope,
-                unit,
-                TIMER_SHOW_PROPERTIES,
-            )));
-            let service_text = if !service.is_empty() {
-                optional_remote_output(runner.run(&systemctl_show_cmd(
-                    scope,
-                    service,
-                    SERVICE_SHOW_PROPERTIES,
-                )))
-            } else {
-                Ok(None)
-            };
-            (timer_text, service_text)
-        })
-        .into_iter()
-        .map(|(timer, service)| Ok((timer?, service?)))
-        .collect::<std::result::Result<Vec<_>, RemoteSourceError>>()?;
+    let mut timer_blocks: HashMap<Scope, HashMap<String, String>> = HashMap::new();
+    let mut service_blocks: HashMap<Scope, HashMap<String, String>> = HashMap::new();
+    for (job, output) in jobs.iter().zip(outputs) {
+        let Some(text) = output else { continue };
+        let target = if job.timers {
+            &mut timer_blocks
+        } else {
+            &mut service_blocks
+        };
+        target
+            .entry(job.scope)
+            .or_default()
+            .extend(SystemdAdapter::parse_show_blocks(&text));
+    }
 
-    for (task, (timer_text, service_text)) in tasks.iter_mut().zip(results) {
-        SystemdAdapter::apply_show(task, timer_text.as_deref(), service_text.as_deref());
+    for task in &mut tasks {
+        let id = task.id.clone();
+        let (scope, unit) = split_task_id(&id);
+        let timer_text = timer_blocks.get(&scope).and_then(|b| b.get(unit));
+        let service_text = service_blocks
+            .get(&scope)
+            .and_then(|b| b.get(&task.command));
+        SystemdAdapter::apply_show(
+            task,
+            timer_text.map(String::as_str),
+            service_text.map(String::as_str),
+        );
     }
 
     Ok(tasks)
+}
+
+/// One batched `systemctl show` to issue over SSH.
+#[derive(Debug, PartialEq, Eq)]
+struct ShowJob {
+    scope: Scope,
+    /// `true` for the timer property set, `false` for the service one.
+    timers: bool,
+    properties: &'static str,
+    units: Vec<String>,
+}
+
+/// Split the listed timers into the `systemctl show` calls to make:
+/// timers and their bound services, per scope, chunked so no single
+/// remote command line grows unbounded.
+fn show_jobs(tasks: &[ScheduledTask]) -> Vec<ShowJob> {
+    let mut jobs = Vec::new();
+    for (scope, timer_units, service_units) in show_unit_groups(tasks) {
+        for chunk in timer_units.chunks(SHOW_CHUNK_SIZE) {
+            jobs.push(ShowJob {
+                scope,
+                timers: true,
+                properties: TIMER_SHOW_PROPERTIES,
+                units: chunk.to_vec(),
+            });
+        }
+        for chunk in service_units.chunks(SHOW_CHUNK_SIZE) {
+            jobs.push(ShowJob {
+                scope,
+                timers: false,
+                properties: SERVICE_SHOW_PROPERTIES,
+                units: chunk.to_vec(),
+            });
+        }
+    }
+    jobs
 }
 
 fn collect_cron(
@@ -706,7 +759,6 @@ fn apply_launchctl_runtime(task: &mut ScheduledTask, entry: Option<&LaunchctlEnt
 mod tests {
     use super::*;
     use shuvjobs_core::ScheduleType;
-    use std::collections::HashMap;
 
     fn collector() -> RemoteCollector {
         RemoteCollector {
@@ -876,10 +928,14 @@ mod tests {
     const SYSTEMD_LIST: &str = r#"[
         {"next":1775919186922121,"left":0,"last":1775499594111976,"passed":0,"unit":"logrotate.timer","activates":"logrotate.service"}
     ]"#;
-    const SYSTEMD_SHOW_TIMER: &str =
-        "TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Sat 2026-04-11 17:04:57 +03 }\n\
-         Result=success\n";
+    // Batched `systemctl show` replies: one block per unit, `Id=` first.
+    const SYSTEMD_SHOW_TIMER: &str = "\
+Id=logrotate.timer
+TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Sat 2026-04-11 17:04:57 +03 }
+Result=success
+";
     const SYSTEMD_SHOW_SERVICE: &str = "\
+Id=logrotate.service
 ExecStart={ path=/usr/sbin/logrotate ; argv[]=/usr/sbin/logrotate /etc/logrotate.conf ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
 Result=success
 ActiveState=inactive
@@ -900,11 +956,11 @@ ExecMainExitTimestampMonotonic=40202376368
             SYSTEMD_LIST,
         );
         fx.insert(
-            "systemctl show 'logrotate.timer' --property=TimersCalendar,TimersMonotonic,Result --no-pager",
+            "systemctl show 'logrotate.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
             SYSTEMD_SHOW_TIMER,
         );
         fx.insert(
-            "systemctl show 'logrotate.service' --property=ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
+            "systemctl show 'logrotate.service' --property=Id,ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
             SYSTEMD_SHOW_SERVICE,
         );
 
@@ -928,10 +984,13 @@ ExecMainExitTimestampMonotonic=40202376368
     const SYSTEMD_USER_LIST: &str = r#"[
         {"next":1788394500000000,"left":1788394500000000,"last":1788308100017251,"passed":15000021453,"unit":"radar-daily.timer","activates":"radar-daily.service"}
     ]"#;
-    const SYSTEMD_USER_SHOW_TIMER: &str =
-        "TimersCalendar={ OnCalendar=*-*-* 09:15:00 ; next_elapse=Thu 2026-09-03 09:15:00 PDT }\n\
-         Result=success\n";
+    const SYSTEMD_USER_SHOW_TIMER: &str = "\
+Id=radar-daily.timer
+TimersCalendar={ OnCalendar=*-*-* 09:15:00 ; next_elapse=Thu 2026-09-03 09:15:00 PDT }
+Result=success
+";
     const SYSTEMD_USER_SHOW_SERVICE: &str = "\
+Id=radar-daily.service
 ExecStart={ path=/home/alice/.local/bin/radar ; argv[]=/home/alice/.local/bin/radar daily ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
 Result=success
 ActiveState=inactive
@@ -958,19 +1017,19 @@ ExecMainExitTimestampMonotonic=40202376368
             SYSTEMD_USER_LIST,
         );
         fx.insert(
-            "systemctl show 'logrotate.timer' --property=TimersCalendar,TimersMonotonic,Result --no-pager",
+            "systemctl show 'logrotate.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
             SYSTEMD_SHOW_TIMER,
         );
         fx.insert(
-            "systemctl show 'logrotate.service' --property=ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
+            "systemctl show 'logrotate.service' --property=Id,ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
             SYSTEMD_SHOW_SERVICE,
         );
         fx.insert(
-            "systemctl --user show 'radar-daily.timer' --property=TimersCalendar,TimersMonotonic,Result --no-pager",
+            "systemctl --user show 'radar-daily.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
             SYSTEMD_USER_SHOW_TIMER,
         );
         fx.insert(
-            "systemctl --user show 'radar-daily.service' --property=ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
+            "systemctl --user show 'radar-daily.service' --property=Id,ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
             SYSTEMD_USER_SHOW_SERVICE,
         );
 
@@ -1001,11 +1060,11 @@ ExecMainExitTimestampMonotonic=40202376368
             SYSTEMD_LIST,
         );
         fx.insert(
-            "systemctl show 'logrotate.timer' --property=TimersCalendar,TimersMonotonic,Result --no-pager",
+            "systemctl show 'logrotate.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
             SYSTEMD_SHOW_TIMER,
         );
         fx.insert(
-            "systemctl show 'logrotate.service' --property=ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
+            "systemctl show 'logrotate.service' --property=Id,ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
             SYSTEMD_SHOW_SERVICE,
         );
 
@@ -1025,12 +1084,165 @@ ExecMainExitTimestampMonotonic=40202376368
             "systemctl list-timers --all --output=json --no-pager"
         );
         assert_eq!(
-            systemctl_show_cmd(Scope::User, "radar-daily.timer", "Result"),
+            systemctl_show_cmd(Scope::User, &["radar-daily.timer".into()], "Result"),
             "systemctl --user show 'radar-daily.timer' --property=Result --no-pager"
         );
         assert_eq!(
-            systemctl_show_cmd(Scope::System, "logrotate.timer", "Result"),
+            systemctl_show_cmd(Scope::System, &["logrotate.timer".into()], "Result"),
             "systemctl show 'logrotate.timer' --property=Result --no-pager"
+        );
+    }
+
+    // Two system timers: the batched `show` must carry both units in one
+    // command, and each block must land on the task named by its `Id=`.
+    const SYSTEMD_LIST_TWO: &str = r#"[
+        {"next":1775919186922121,"left":0,"last":1775499594111976,"passed":0,"unit":"logrotate.timer","activates":"logrotate.service"},
+        {"next":1775919186922121,"left":0,"last":0,"passed":0,"unit":"man-db.timer","activates":"man-db.service"}
+    ]"#;
+    // Deliberately reversed relative to the request order, and with the
+    // service blocks in a different order again.
+    const SYSTEMD_SHOW_TIMER_BATCH: &str = "\
+Id=man-db.timer
+TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Wed 2026-09-02 00:00:00 PDT }
+Result=success
+
+Id=logrotate.timer
+TimersMonotonic={ OnBootSec=15min ; next_elapse=4h 12min left }
+Result=success
+";
+    const SYSTEMD_SHOW_SERVICE_BATCH: &str = "\
+Id=man-db.service
+ExecStart={ path=/usr/bin/mandb ; argv[]=/usr/bin/mandb --quiet ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Result=success
+ActiveState=inactive
+SubState=dead
+ExecMainStartTimestampMonotonic=0
+ExecMainExitTimestampMonotonic=0
+
+Id=logrotate.service
+ExecStart={ path=/usr/sbin/logrotate ; argv[]=/usr/sbin/logrotate /etc/logrotate.conf ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Result=success
+ActiveState=inactive
+SubState=dead
+ExecMainStartTimestampMonotonic=40202351753
+ExecMainExitTimestampMonotonic=40202376368
+";
+
+    #[test]
+    fn systemd_batches_show_and_keys_blocks_by_id() {
+        let mut fx = HashMap::new();
+        fx.insert(
+            "command -v systemctl >/dev/null 2>&1 && echo present",
+            "present\n",
+        );
+        fx.insert(
+            "systemctl list-timers --all --output=json --no-pager",
+            SYSTEMD_LIST_TWO,
+        );
+        // Units are sorted, so `logrotate` precedes `man-db`; one command
+        // for both timers and one for both services.
+        fx.insert(
+            "systemctl show 'logrotate.timer' 'man-db.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
+            SYSTEMD_SHOW_TIMER_BATCH,
+        );
+        fx.insert(
+            "systemctl show 'logrotate.service' 'man-db.service' --property=Id,ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
+            SYSTEMD_SHOW_SERVICE_BATCH,
+        );
+
+        let tasks = collect_systemd(&FixtureRunner::new(fx)).unwrap();
+        assert_eq!(tasks.len(), 2);
+
+        let logrotate = &tasks[0];
+        assert_eq!(logrotate.id, "logrotate.timer");
+        assert_eq!(logrotate.command, "/usr/sbin/logrotate /etc/logrotate.conf");
+        assert_eq!(
+            logrotate.schedule,
+            ScheduleType::Interval(std::time::Duration::from_secs(900))
+        );
+        assert_eq!(
+            logrotate.last_duration,
+            Some(std::time::Duration::from_micros(24_615))
+        );
+
+        let man_db = &tasks[1];
+        assert_eq!(man_db.id, "man-db.timer");
+        assert_eq!(man_db.command, "/usr/bin/mandb --quiet");
+        assert!(matches!(man_db.schedule, ScheduleType::Calendar(ref c) if c == "*-*-* 00:00:00"));
+        // Never triggered and clean: no status, as before batching.
+        assert!(man_db.last_status.is_none());
+    }
+
+    /// A unit absent from the batched reply keeps its `list-timers` data
+    /// rather than borrowing the neighbouring block.
+    #[test]
+    fn systemd_keeps_list_timers_data_when_a_block_is_missing() {
+        let mut fx = HashMap::new();
+        fx.insert(
+            "command -v systemctl >/dev/null 2>&1 && echo present",
+            "present\n",
+        );
+        fx.insert(
+            "systemctl list-timers --all --output=json --no-pager",
+            SYSTEMD_LIST_TWO,
+        );
+        fx.insert(
+            "systemctl show 'logrotate.timer' 'man-db.timer' --property=Id,TimersCalendar,TimersMonotonic,Result --no-pager",
+            "Id=man-db.timer\nTimersCalendar={ OnCalendar=daily ; next_elapse=Wed 2026-09-02 00:00:00 PDT }\nResult=success\n",
+        );
+
+        let tasks = collect_systemd(&FixtureRunner::new(fx)).unwrap();
+        assert_eq!(tasks.len(), 2);
+        // No timer block and no service block: the bound unit name stays.
+        assert_eq!(tasks[0].id, "logrotate.timer");
+        assert_eq!(tasks[0].command, "logrotate.service");
+        assert_eq!(tasks[0].schedule, ScheduleType::Calendar(String::new()));
+        assert!(matches!(tasks[1].schedule, ScheduleType::Calendar(ref c) if c == "daily"));
+    }
+
+    #[test]
+    fn show_jobs_are_two_per_scope_and_chunked() {
+        let tasks = SystemdAdapter::parse_list_timers(SYSTEMD_LIST_TWO).unwrap();
+        let jobs = show_jobs(&tasks);
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs[0].timers);
+        assert_eq!(jobs[0].scope, Scope::System);
+        assert_eq!(jobs[0].units, ["logrotate.timer", "man-db.timer"]);
+        assert!(!jobs[1].timers);
+        assert_eq!(jobs[1].units, ["logrotate.service", "man-db.service"]);
+
+        // 150 timers: 3 timer chunks + 3 service chunks at 64 units each.
+        let many: Vec<_> = (0..150)
+            .map(|i| {
+                let mut t = tasks[0].clone();
+                t.id = format!("t{i:03}.timer");
+                t.command = format!("t{i:03}.service");
+                t
+            })
+            .collect();
+        let jobs = show_jobs(&many);
+        assert_eq!(jobs.len(), 6);
+        assert_eq!(
+            jobs.iter().map(|j| j.units.len()).collect::<Vec<_>>(),
+            [64, 64, 22, 64, 64, 22]
+        );
+        assert!(jobs.iter().all(|j| j.scope == Scope::System));
+    }
+
+    #[test]
+    fn show_jobs_are_empty_without_timers() {
+        assert!(show_jobs(&[]).is_empty());
+    }
+
+    #[test]
+    fn systemctl_show_cmd_quotes_every_unit_in_a_batch() {
+        assert_eq!(
+            systemctl_show_cmd(
+                Scope::System,
+                &["a.timer".to_string(), "b.timer".to_string()],
+                "Id,Result"
+            ),
+            "systemctl show 'a.timer' 'b.timer' --property=Id,Result --no-pager"
         );
     }
 
