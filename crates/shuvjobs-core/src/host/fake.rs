@@ -48,6 +48,7 @@ pub struct FakeHost {
     policy: PrivilegePolicy,
     root_only: Vec<String>,
     os: HostOs,
+    offset: FixedOffset,
     /// Responses per command, consumed in order; the last one repeats.
     scripts: BTreeMap<String, Vec<CmdOutput>>,
     default_output: CmdOutput,
@@ -66,6 +67,7 @@ impl FakeHost {
             policy: PrivilegePolicy::default(),
             root_only: Vec::new(),
             os: HostOs::Linux,
+            offset: FixedOffset::east_opt(0).expect("UTC is a valid offset"),
             scripts: BTreeMap::new(),
             default_output: CmdOutput {
                 // Unscripted commands look like a missing binary, so a
@@ -86,6 +88,13 @@ impl FakeHost {
 
     pub fn with_os(mut self, os: HostOs) -> Self {
         self.os = os;
+        self
+    }
+
+    /// The offset `date +%z` would report. Writers that render a local
+    /// wall-clock time — `at -t` — are pinned against a non-zero one.
+    pub fn with_offset(mut self, offset: FixedOffset) -> Self {
+        self.offset = offset;
         self
     }
 
@@ -188,7 +197,7 @@ impl Host for FakeHost {
     }
 
     fn utc_offset(&self) -> Result<FixedOffset> {
-        Ok(FixedOffset::east_opt(0).expect("UTC is a valid offset"))
+        Ok(self.offset)
     }
 
     fn run(&self, cmd: &str, stdin: Option<&[u8]>, privilege: Privilege) -> Result<CmdOutput> {
@@ -411,6 +420,12 @@ mod tests {
             FakeHost::new().with_os(HostOs::MacOs).os().unwrap(),
             HostOs::MacOs
         );
+    }
+
+    #[test]
+    fn the_utc_offset_is_configurable() {
+        let host = FakeHost::new().with_offset(FixedOffset::east_opt(3 * 3600).unwrap());
+        assert_eq!(host.utc_offset().unwrap().local_minus_utc(), 3 * 3600);
     }
 
     #[test]

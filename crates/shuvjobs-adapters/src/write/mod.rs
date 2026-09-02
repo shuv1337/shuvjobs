@@ -6,6 +6,7 @@
 //! name, and sometimes a shell word, so it has to be safe in all three.
 
 pub mod anacron;
+pub mod at;
 pub mod calendar;
 pub mod cron;
 pub mod systemd;
@@ -30,6 +31,10 @@ pub fn writers_for(host: Arc<dyn Host>) -> HashMap<TaskSourceKind, Box<dyn JobWr
     writers.insert(
         TaskSourceKind::Anacron,
         Box::new(anacron::AnacronWriter::new(Arc::clone(&host))),
+    );
+    writers.insert(
+        TaskSourceKind::At,
+        Box::new(at::AtWriter::new(Arc::clone(&host))),
     );
     writers.insert(
         TaskSourceKind::Systemd,
