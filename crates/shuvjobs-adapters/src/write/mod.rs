@@ -9,6 +9,7 @@ pub mod anacron;
 pub mod at;
 pub mod calendar;
 pub mod cron;
+pub mod launchd;
 pub mod systemd;
 
 use std::collections::HashMap;
@@ -35,6 +36,10 @@ pub fn writers_for(host: Arc<dyn Host>) -> HashMap<TaskSourceKind, Box<dyn JobWr
     writers.insert(
         TaskSourceKind::At,
         Box::new(at::AtWriter::new(Arc::clone(&host))),
+    );
+    writers.insert(
+        TaskSourceKind::Launchd,
+        Box::new(launchd::LaunchdWriter::new(Arc::clone(&host))),
     );
     writers.insert(
         TaskSourceKind::Systemd,
