@@ -14,9 +14,9 @@ use std::process::Command;
 use std::thread;
 
 use anyhow::{anyhow, bail, Result};
-use chrono::{DateTime, Datelike, FixedOffset, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 use shuvjobs_adapters::{
-    anacron::period_advance as anacron_period_advance,
+    anacron::run_times_from_spool,
     cron::crontab_list_args,
     launchd::LaunchctlEntry,
     systemd::{
@@ -669,15 +669,9 @@ fn collect_anacron(
         let cmd = format!("cat /var/spool/anacron/{job_id} 2>/dev/null");
         if let Some(spool) = optional_remote_output(runner.run(&cmd))? {
             if let Some(date) = AnacronAdapter::parse_spool_file(&spool) {
-                if let Some(last) = Utc
-                    .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
-                    .single()
-                {
-                    task.last_run = Some(last);
-                    if let Some(d) = anacron_period_advance(&task.schedule) {
-                        task.next_run = Some(last + d);
-                    }
-                }
+                let (last, next) = run_times_from_spool(date, &task.schedule, Utc::now());
+                task.last_run = last;
+                task.next_run = next;
             }
         }
     }
@@ -1384,7 +1378,9 @@ ExecMainExitTimestampMonotonic=40202376368
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0].name, "cron.daily");
         assert!(tasks[0].last_run.is_some());
+        // The 2026-04-10 spool date is long past, so the daily job is due now.
         assert!(tasks[0].next_run > tasks[0].last_run);
+        assert!(tasks[0].next_run.unwrap() <= Utc::now());
         // monthly entry has no spool fixture
         assert!(tasks[1].last_run.is_none());
     }

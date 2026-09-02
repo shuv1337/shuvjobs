@@ -97,13 +97,7 @@ impl SystemdAdapter {
             #[serde(default)]
             next: Option<i64>,
             #[serde(default)]
-            #[allow(dead_code)]
-            left: Option<i64>,
-            #[serde(default)]
             last: Option<i64>,
-            #[serde(default)]
-            #[allow(dead_code)]
-            passed: Option<i64>,
             unit: String,
             #[serde(default)]
             activates: String,

@@ -45,4 +45,6 @@
   timer, locally and over SSH. Blocks are keyed by the unit's `Id=`, so a
   missing or reordered block can never be applied to the wrong task.
   Local `--json` collection on a 12-task host drops from ~46 ms to ~24 ms.
+- Report an overdue anacron job as due now instead of showing a next run in
+  the past.
 - Verify the declared minimum Rust version in CI.

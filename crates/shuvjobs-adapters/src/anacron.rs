@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use chrono::{Datelike, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use shuvjobs_core::{Error, Result, ScheduleType, ScheduledTask, TaskSource, TaskSourceKind};
 
 #[derive(Debug, Default)]
@@ -91,14 +91,9 @@ impl TaskSource for AnacronAdapter {
             let Some(date) = Self::parse_spool_file(&text) else {
                 continue;
             };
-            // anacron only records the date — pin to UTC midnight.
-            let last = Utc
-                .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
-                .single();
+            let (last, next) = run_times_from_spool(date, &task.schedule, Utc::now());
             task.last_run = last;
-            if let (Some(last), Some(d)) = (last, period_advance(&task.schedule)) {
-                task.next_run = Some(last + d);
-            }
+            task.next_run = next;
         }
 
         Ok(tasks)
@@ -130,8 +125,6 @@ impl Period {
 #[derive(Debug)]
 struct Entry {
     period: Period,
-    #[allow(dead_code)]
-    delay_minutes: u64,
     job_id: String,
     command: String,
 }
@@ -154,13 +147,34 @@ fn parse_entry(line: &str) -> Option<Entry> {
     }
 
     let period = Period::parse(period_tok)?;
-    let delay_minutes: u64 = delay_tok.parse().ok()?;
+    // The delay column (minutes after anacron starts) must be numeric,
+    // but it does not affect when the job is *due*, so it is not kept.
+    let _delay_minutes: u64 = delay_tok.parse().ok()?;
     Some(Entry {
         period,
-        delay_minutes,
         job_id,
         command,
     })
+}
+
+/// Last and next run derived from a spool date. anacron only records the
+/// date, so the last run is pinned to UTC midnight. A job whose period has
+/// already elapsed is *due*: anacron runs it the next time it wakes (boot or
+/// its daily cron hook), so the next run is reported as `now` rather than a
+/// timestamp in the past. Shared with the SSH bridge.
+pub fn run_times_from_spool(
+    date: NaiveDate,
+    schedule: &ScheduleType,
+    now: DateTime<Utc>,
+) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+    let last = Utc
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+        .single();
+    let next = match (last, period_advance(schedule)) {
+        (Some(last), Some(d)) => Some((last + d).max(now)),
+        _ => None,
+    };
+    (last, next)
 }
 
 /// How far anacron will wait after a recorded run before the job is due
@@ -282,6 +296,40 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
             period_advance(&tasks[2].schedule),
             Some(chrono::Duration::days(365))
         );
+    }
+
+    #[test]
+    fn spool_run_times_future_period_is_last_plus_period() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 4, 10).unwrap();
+        let weekly = ScheduleType::Interval(Duration::from_secs(7 * 86_400));
+        let (last, next) = run_times_from_spool(date, &weekly, now);
+        assert_eq!(
+            last,
+            Some(Utc.with_ymd_and_hms(2026, 4, 10, 0, 0, 0).unwrap())
+        );
+        assert_eq!(
+            next,
+            Some(Utc.with_ymd_and_hms(2026, 4, 17, 0, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn spool_run_times_overdue_job_is_due_now() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 4, 10).unwrap();
+        let daily = ScheduleType::Interval(Duration::from_secs(86_400));
+        let (_, next) = run_times_from_spool(date, &daily, now);
+        assert_eq!(next, Some(now));
+    }
+
+    #[test]
+    fn spool_run_times_unknown_period_has_no_next() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 4, 10).unwrap();
+        let (last, next) = run_times_from_spool(date, &ScheduleType::Cron("x".into()), now);
+        assert!(last.is_some());
+        assert!(next.is_none());
     }
 
     #[test]
