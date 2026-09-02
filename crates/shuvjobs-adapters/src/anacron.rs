@@ -51,6 +51,8 @@ impl AnacronAdapter {
                 last_duration: None,
                 next_run: None,
                 command: entry.command,
+                location: None,
+                enabled: None,
             });
         }
         out

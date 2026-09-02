@@ -31,6 +31,8 @@ fn scheduled_task_can_be_constructed_with_all_fields() {
         last_duration: Some(Duration::from_secs(2)),
         next_run: Some(Utc.with_ymd_and_hms(2026, 4, 11, 0, 0, 0).unwrap()),
         command: "/usr/sbin/logrotate /etc/logrotate.conf".into(),
+        location: None,
+        enabled: None,
     };
     assert_eq!(t.source, TaskSourceKind::Systemd);
     assert!(matches!(t.schedule, ScheduleType::Calendar(_)));

@@ -69,6 +69,8 @@ impl CronAdapter {
                 last_duration: None,
                 next_run,
                 command,
+                location: None,
+                enabled: None,
             });
         }
         out
@@ -99,6 +101,8 @@ impl CronAdapter {
                 last_duration: None,
                 next_run,
                 command: format!("{dir}/{script}"),
+                location: None,
+                enabled: None,
             })
             .collect()
     }

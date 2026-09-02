@@ -1504,6 +1504,8 @@ ExecMainExitTimestampMonotonic=40202376368
             last_duration: None,
             next_run: None,
             command: "/usr/local/bin/heartbeat".into(),
+            location: None,
+            enabled: None,
         }
     }
 

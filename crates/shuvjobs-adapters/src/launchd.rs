@@ -118,6 +118,8 @@ impl LaunchdAdapter {
             last_duration: None,
             next_run,
             command,
+            location: None,
+            enabled: None,
         }))
     }
 }

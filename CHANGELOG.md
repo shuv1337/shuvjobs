@@ -48,3 +48,7 @@
 - Report an overdue anacron job as due now instead of showing a next run in
   the past.
 - Verify the declared minimum Rust version in CI.
+- Add `location` and `enabled` to the JSON task export: `location` is the
+  backing file (cron file, systemd `FragmentPath`, anacrontab, launchd
+  plist) and `enabled` is whether the job would run, both `null` when the
+  source has no such notion. Older JSON without the keys still loads.

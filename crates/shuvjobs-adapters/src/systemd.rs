@@ -121,6 +121,8 @@ impl SystemdAdapter {
                 last_duration: None,
                 next_run: micros_to_dt(r.next.unwrap_or(0)),
                 command: r.activates,
+                location: None,
+                enabled: None,
             })
             .collect();
         Ok(tasks)
@@ -751,6 +753,8 @@ ExecMainExitTimestampMonotonic=40202376368
             last_duration: None,
             next_run: None,
             command: "logrotate.service".into(),
+            location: None,
+            enabled: None,
         }
     }
 
@@ -1007,6 +1011,8 @@ ExecStart={ path=/usr/bin/mandb ; argv[]=/usr/bin/mandb --quiet ; ignore_errors=
             last_duration: None,
             next_run: None,
             command: command.into(),
+            location: None,
+            enabled: None,
         }
     }
 

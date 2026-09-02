@@ -27,6 +27,13 @@ pub struct ExportTask {
     pub last_status_detail: Option<String>,
     pub last_duration_secs: Option<f64>,
     pub command: String,
+    /// Backing file the job lives in; null when the source has none
+    /// (per-user crontabs, `at`).
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Whether the job would run; null when unknown or not applicable.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +79,8 @@ impl From<&ScheduledTask> for ExportTask {
             last_status_detail,
             last_duration_secs: t.last_duration.map(|d| d.as_secs_f64()),
             command: t.command.clone(),
+            location: t.location.clone(),
+            enabled: t.enabled,
         }
     }
 }
@@ -119,6 +128,8 @@ impl TryFrom<ExportTask> for ScheduledTask {
             last_duration: e.last_duration_secs.map(Duration::from_secs_f64),
             next_run: e.next_run,
             command: e.command,
+            location: e.location,
+            enabled: e.enabled,
         })
     }
 }
@@ -156,6 +167,8 @@ mod tests {
             last_duration: Some(Duration::from_millis(1200)),
             next_run: Some(Utc.with_ymd_and_hms(2026, 4, 11, 0, 0, 0).unwrap()),
             command: "/usr/sbin/logrotate /etc/logrotate.conf".into(),
+            location: None,
+            enabled: None,
         }
     }
 
@@ -179,6 +192,8 @@ mod tests {
             last_duration: None,
             next_run: None,
             command: "/usr/local/bin/metrics-flush".into(),
+            location: None,
+            enabled: None,
         };
         let json = serialize_tasks(std::slice::from_ref(&task)).unwrap();
         let back = deserialize_tasks(&json).unwrap();
@@ -197,6 +212,8 @@ mod tests {
             last_duration: None,
             next_run: None,
             command: "/usr/lib/snapper/systemd-helper --cleanup".into(),
+            location: None,
+            enabled: None,
         };
         let json = serialize_tasks(std::slice::from_ref(&task)).unwrap();
         let back = deserialize_tasks(&json).unwrap();
@@ -216,6 +233,8 @@ mod tests {
             last_duration: None,
             next_run: Some(dt),
             command: "echo hello".into(),
+            location: None,
+            enabled: None,
         };
         let json = serialize_tasks(std::slice::from_ref(&task)).unwrap();
         let back = deserialize_tasks(&json).unwrap();
@@ -238,6 +257,39 @@ mod tests {
         assert!(json.contains("\"source\": \"systemd\""));
         assert!(json.contains("\"schedule_type\": \"calendar\""));
         assert!(json.contains("\"last_status\": \"success\""));
+    }
+
+    #[test]
+    fn round_trips_location_and_enabled() {
+        let mut task = fixture_task();
+        task.location = Some("/etc/systemd/system/logrotate.timer".into());
+        task.enabled = Some(false);
+        let json = serialize_tasks(std::slice::from_ref(&task)).unwrap();
+        let back = deserialize_tasks(&json).unwrap();
+        assert_eq!(back[0], task);
+    }
+
+    #[test]
+    fn json_contains_location_and_enabled_keys() {
+        let mut task = fixture_task();
+        task.location = Some("/etc/systemd/system/logrotate.timer".into());
+        task.enabled = Some(true);
+        let json = serialize_tasks(&[task]).unwrap();
+        assert!(json.contains("\"location\": \"/etc/systemd/system/logrotate.timer\""));
+        assert!(json.contains("\"enabled\": true"));
+    }
+
+    #[test]
+    fn missing_location_and_enabled_keys_default_to_none() {
+        let old = r#"[{
+            "id":"at:12","name":"at job 12","source":"at","schedule":"2026-04-14T14:00:00+00:00",
+            "schedule_type":"oneshot","last_run":null,"next_run":null,
+            "last_status":null,"last_status_detail":null,
+            "last_duration_secs":null,"command":"echo hello"
+        }]"#;
+        let tasks = deserialize_tasks(old).unwrap();
+        assert_eq!(tasks[0].location, None);
+        assert_eq!(tasks[0].enabled, None);
     }
 
     #[test]

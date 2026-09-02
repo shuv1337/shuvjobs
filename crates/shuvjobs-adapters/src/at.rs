@@ -46,6 +46,8 @@ impl AtAdapter {
                 last_duration: None,
                 next_run: Some(parsed.scheduled),
                 command: String::new(),
+                location: None,
+                enabled: None,
             });
         }
         tasks

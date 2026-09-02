@@ -163,6 +163,8 @@ mod tests {
             last_duration: None,
             next_run: None,
             command: command.into(),
+            location: None,
+            enabled: None,
         }
     }
 
