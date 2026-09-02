@@ -12,7 +12,7 @@
 //! unit's own `Result=` stays `success` even when every activation of
 //! the service it fires has failed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Duration;
 
@@ -123,6 +123,69 @@ impl SystemdAdapter {
                 command: r.activates,
                 location: None,
                 enabled: None,
+            })
+            .collect();
+        Ok(tasks)
+    }
+
+    /// Parse `systemctl [--user] list-unit-files --type=timer --all
+    /// --output=json --no-pager` into placeholder tasks.
+    ///
+    /// `list-timers` only reports *loaded* units, so a timer that was
+    /// `disable --now`d vanishes from it entirely and `list`/`enable`/
+    /// `edit`/`rm` would report it as not found. The unit-file listing is
+    /// the complete inventory; every row is turned into a task carrying
+    /// just its identity and enablement, and the batched `systemctl show`
+    /// then fills in schedule, command and location (systemd loads an
+    /// unloaded unit on demand for `show`).
+    ///
+    /// Template units (`foo@.timer`) are skipped: they are not schedulable
+    /// on their own, only their instances are.
+    pub fn parse_list_unit_files_scoped(json: &str, scope: Scope) -> Result<Vec<ScheduledTask>> {
+        // Field names captured from `systemctl list-unit-files
+        // --type=timer --all --output=json --no-pager` on systemd 258.
+        // `state` is a string in practice; `preset` is unused.
+        #[derive(Deserialize)]
+        struct Row {
+            unit_file: String,
+            #[serde(default)]
+            state: Option<String>,
+        }
+
+        let rows: Vec<Row> = serde_json::from_str(json).map_err(|e| Error::Parse {
+            kind: "systemctl list-unit-files".into(),
+            message: e.to_string(),
+        })?;
+
+        let tasks = rows
+            .into_iter()
+            .filter_map(|r| {
+                // Some systemd versions print the full path here.
+                let unit = r.unit_file.rsplit('/').next()?;
+                if unit.contains('@') || !unit.ends_with(".timer") {
+                    return None;
+                }
+                Some(ScheduledTask {
+                    id: scope.task_id(unit),
+                    name: scope.task_name(unit),
+                    source: TaskSourceKind::Systemd,
+                    // Filled in later by apply_show.
+                    schedule: ScheduleType::Calendar(String::new()),
+                    last_run: None,
+                    last_status: None,
+                    last_duration: None,
+                    next_run: None,
+                    // systemd's default binding when the unit sets no
+                    // `Unit=`; replaced by the service's ExecStart once
+                    // `show` answers.
+                    command: default_service_unit(unit),
+                    location: None,
+                    enabled: state_enabled(
+                        r.state.as_deref().filter(|s| !s.is_empty()),
+                        // An unloaded unit is by definition not active.
+                        None,
+                    ),
+                })
             })
             .collect();
         Ok(tasks)
@@ -274,6 +337,21 @@ pub const TIMER_SHOW_PROPERTIES: &str =
 /// (locally) or the remote shell's command-line limit over SSH.
 pub const SHOW_CHUNK_SIZE: usize = 64;
 
+/// `systemctl [--user] <LIST_TIMERS_ARGS>`: the loaded timers, with their
+/// next/last elapse. Shared so the local adapter and the SSH bridge issue
+/// byte-identical commands.
+pub const LIST_TIMERS_ARGS: [&str; 4] = ["list-timers", "--all", "--output=json", "--no-pager"];
+
+/// `systemctl [--user] <LIST_UNIT_FILES_ARGS>`: every installed timer unit
+/// file, loaded or not. The only way to see a `disable --now`d timer.
+pub const LIST_UNIT_FILES_ARGS: [&str; 5] = [
+    "list-unit-files",
+    "--type=timer",
+    "--all",
+    "--output=json",
+    "--no-pager",
+];
+
 /// Units to query per scope for a batch of listed timers, as
 /// `(scope, timer units, service units)`. Both lists are sorted and
 /// deduplicated, and scopes with no timers are omitted, so callers can
@@ -369,7 +447,7 @@ impl TaskSource for SystemdAdapter {
         }
 
         let listing = Command::new("systemctl")
-            .args(["list-timers", "--all", "--output=json", "--no-pager"])
+            .args(LIST_TIMERS_ARGS)
             .output()
             .map_err(|e| Error::Command {
                 command: "systemctl list-timers".into(),
@@ -389,9 +467,22 @@ impl TaskSource for SystemdAdapter {
         // running as root without XDG_RUNTIME_DIR all make `systemctl
         // --user` exit non-zero. That is "nothing to report", never an
         // adapter error.
-        if let Some(json) = run_list_timers(Scope::User) {
+        if let Some(json) = run_scoped_listing(Scope::User, LIST_TIMERS_ARGS.as_slice()) {
             if let Ok(user_tasks) = Self::parse_list_timers_scoped(&json, Scope::User) {
                 tasks.extend(user_tasks);
+            }
+        }
+
+        // `list-timers` stops at loaded units, so a disabled and stopped
+        // timer is missing from it. Fill the gap from the unit-file
+        // inventory; the `show` pass below gives these the same schedule,
+        // command and location as any listed timer.
+        for scope in [Scope::System, Scope::User] {
+            let Some(json) = run_scoped_listing(scope, LIST_UNIT_FILES_ARGS.as_slice()) else {
+                continue;
+            };
+            if let Ok(extra) = Self::parse_list_unit_files_scoped(&json, scope) {
+                merge_unit_file_tasks(&mut tasks, extra);
             }
         }
 
@@ -421,12 +512,12 @@ impl TaskSource for SystemdAdapter {
     }
 }
 
-/// `systemctl [--user] list-timers` stdout, or `None` when that manager
-/// is not reachable.
-fn run_list_timers(scope: Scope) -> Option<String> {
+/// Stdout of `systemctl [--user] <args>`, or `None` when that manager is
+/// not reachable or the listing failed.
+fn run_scoped_listing(scope: Scope, args: &[&str]) -> Option<String> {
     let out = Command::new("systemctl")
         .args(scope.systemctl_args())
-        .args(["list-timers", "--all", "--output=json", "--no-pager"])
+        .args(args)
         .output()
         .ok()?;
     if !out.status.success() {
@@ -458,16 +549,35 @@ impl ShowTimer {
     /// honest answer is whether the timer is currently loaded and
     /// running — `ActiveState=active`.
     pub fn enabled(&self) -> Option<bool> {
-        let active = self.active_state.as_deref();
-        match self.unit_file_state.as_deref() {
-            Some("enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "alias") => {
-                Some(true)
-            }
-            Some("disabled" | "masked" | "masked-runtime") => Some(false),
-            Some(_) => Some(active == Some("active")),
-            None => active.map(|state| state == "active"),
-        }
+        state_enabled(
+            self.unit_file_state.as_deref(),
+            self.active_state.as_deref(),
+        )
     }
+}
+
+/// Shared `UnitFileState` (+ `ActiveState` fallback) → enablement mapping,
+/// so a timer synthesized from `list-unit-files` and one read back from
+/// `systemctl show` answer the same way.
+pub fn state_enabled(unit_file_state: Option<&str>, active_state: Option<&str>) -> Option<bool> {
+    match unit_file_state {
+        Some("enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "alias") => Some(true),
+        Some("disabled" | "masked" | "masked-runtime") => Some(false),
+        Some(_) => Some(active_state == Some("active")),
+        None => active_state.map(|state| state == "active"),
+    }
+}
+
+/// The service a timer activates when it declares no explicit `Unit=`.
+fn default_service_unit(timer_unit: &str) -> String {
+    format!("{}.service", trim_unit_suffix(timer_unit))
+}
+
+/// Append the unit-file-only timers in `extra` to `tasks`, keeping the
+/// richer `list-timers` entry whenever both listings name the same unit.
+pub fn merge_unit_file_tasks(tasks: &mut Vec<ScheduledTask>, extra: Vec<ScheduledTask>) {
+    let known: HashSet<String> = tasks.iter().map(|t| t.id.clone()).collect();
+    tasks.extend(extra.into_iter().filter(|t| !known.contains(&t.id)));
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1190,6 +1300,184 @@ ExecStart={ path=/usr/bin/mandb ; argv[]=/usr/bin/mandb --quiet ; ignore_errors=
     fn show_property_sets_request_id_first() {
         assert!(TIMER_SHOW_PROPERTIES.starts_with("Id,"));
         assert!(SERVICE_SHOW_PROPERTIES.starts_with("Id,"));
+    }
+
+    // Captured verbatim from `systemctl list-unit-files --type=timer
+    // --all --output=json --no-pager` on an Arch host (systemd 258),
+    // trimmed to five rows. `btrfs-scrub@.timer` is a template.
+    const LIST_UNIT_FILES_FIXTURE: &str = r#"[
+        {"unit_file":"archlinux-keyring-wkd-sync.timer","state":"static","preset":null},
+        {"unit_file":"btrbk.timer","state":"disabled","preset":"disabled"},
+        {"unit_file":"btrfs-scrub@.timer","state":"disabled","preset":"disabled"},
+        {"unit_file":"logrotate.timer","state":"enabled","preset":"disabled"},
+        {"unit_file":"snapper-cleanup.timer","state":"enabled","preset":"disabled"}
+    ]"#;
+
+    // Same command with `--user` on the same host.
+    const USER_LIST_UNIT_FILES_FIXTURE: &str = r#"[
+        {"unit_file":"radar-daily.timer","state":"enabled","preset":"enabled"},
+        {"unit_file":"shuvmon-agent.timer","state":"disabled","preset":"enabled"}
+    ]"#;
+
+    #[test]
+    fn parse_list_unit_files_reads_every_installed_timer() {
+        let tasks =
+            SystemdAdapter::parse_list_unit_files_scoped(LIST_UNIT_FILES_FIXTURE, Scope::System)
+                .unwrap();
+        // The template unit is skipped.
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "archlinux-keyring-wkd-sync.timer",
+                "btrbk.timer",
+                "logrotate.timer",
+                "snapper-cleanup.timer"
+            ]
+        );
+        // `static` with nothing loaded is not enabled.
+        assert_eq!(tasks[0].enabled, Some(false));
+        assert_eq!(tasks[1].enabled, Some(false));
+        assert_eq!(tasks[2].enabled, Some(true));
+        assert_eq!(tasks[1].name, "btrbk");
+        assert_eq!(tasks[1].source, TaskSourceKind::Systemd);
+        // The default bound service, so the batched service `show` can
+        // still fill in the command.
+        assert_eq!(tasks[1].command, "btrbk.service");
+        assert_eq!(tasks[1].schedule, ScheduleType::Calendar(String::new()));
+        assert!(tasks[1].last_run.is_none());
+        assert!(tasks[1].next_run.is_none());
+        assert!(tasks[1].location.is_none());
+    }
+
+    #[test]
+    fn parse_list_unit_files_scopes_user_ids_and_names() {
+        let tasks =
+            SystemdAdapter::parse_list_unit_files_scoped(USER_LIST_UNIT_FILES_FIXTURE, Scope::User)
+                .unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "user/radar-daily.timer");
+        assert_eq!(tasks[0].name, "radar-daily (user)");
+        assert_eq!(tasks[0].enabled, Some(true));
+        assert_eq!(tasks[1].id, "user/shuvmon-agent.timer");
+        assert_eq!(tasks[1].command, "shuvmon-agent.service");
+        assert_eq!(tasks[1].enabled, Some(false));
+    }
+
+    /// Older systemd prints the full path in the `unit_file` column.
+    #[test]
+    fn parse_list_unit_files_accepts_full_paths_and_skips_non_timers() {
+        let json = r#"[
+            {"unit_file":"/usr/lib/systemd/system/logrotate.timer","state":"masked","preset":null},
+            {"unit_file":"logrotate.service","state":"static","preset":null}
+        ]"#;
+        let tasks = SystemdAdapter::parse_list_unit_files_scoped(json, Scope::System).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "logrotate.timer");
+        // Masked units exist and are listed, just never enabled.
+        assert_eq!(tasks[0].enabled, Some(false));
+    }
+
+    #[test]
+    fn parse_list_unit_files_surfaces_parse_errors() {
+        let err =
+            SystemdAdapter::parse_list_unit_files_scoped("not json", Scope::System).unwrap_err();
+        assert!(matches!(err, Error::Parse { .. }));
+    }
+
+    /// The merge is the whole fix: a timer only `list-unit-files` knows
+    /// about becomes a task, and one both listings name is not doubled.
+    #[test]
+    fn merge_unit_file_tasks_adds_only_the_unlisted_timers() {
+        let mut tasks =
+            SystemdAdapter::parse_list_timers_scoped(LIST_TIMERS_FIXTURE, Scope::System).unwrap();
+        tasks[1].last_run = Some(Utc.timestamp_opt(1_775_499_594, 0).single().unwrap());
+        let extra =
+            SystemdAdapter::parse_list_unit_files_scoped(LIST_UNIT_FILES_FIXTURE, Scope::System)
+                .unwrap();
+        merge_unit_file_tasks(&mut tasks, extra);
+
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                // From list-timers, in order, none duplicated.
+                "snapper-cleanup.timer",
+                "logrotate.timer",
+                "apport-autoreport.timer",
+                // Unit-file-only, appended.
+                "archlinux-keyring-wkd-sync.timer",
+                "btrbk.timer",
+            ]
+        );
+        // The listed entry keeps its richer data rather than being
+        // replaced by the placeholder.
+        let logrotate = &tasks[1];
+        assert!(logrotate.last_run.is_some());
+        assert_eq!(logrotate.enabled, None);
+        // The disabled-only unit arrives knowing it is off.
+        assert_eq!(tasks[4].enabled, Some(false));
+    }
+
+    /// Scope is part of identity: the same unit name in both managers is
+    /// two tasks, not one.
+    #[test]
+    fn merge_unit_file_tasks_keeps_the_scopes_apart() {
+        let mut tasks = vec![scoped_task("logrotate.timer", "logrotate.service")];
+        let extra = SystemdAdapter::parse_list_unit_files_scoped(
+            r#"[{"unit_file":"logrotate.timer","state":"disabled","preset":null}]"#,
+            Scope::User,
+        )
+        .unwrap();
+        merge_unit_file_tasks(&mut tasks, extra);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].id, "user/logrotate.timer");
+    }
+
+    /// `apply_show` must be able to finish a placeholder off: a disabled,
+    /// unloaded timer still answers `systemctl show`.
+    #[test]
+    fn apply_show_fills_in_a_unit_file_placeholder() {
+        let mut task = SystemdAdapter::parse_list_unit_files_scoped(
+            r#"[{"unit_file":"btrbk.timer","state":"disabled","preset":"disabled"}]"#,
+            Scope::System,
+        )
+        .unwrap()
+        .remove(0);
+        let timer = "Id=btrbk.timer
+ActiveState=inactive
+FragmentPath=/usr/lib/systemd/system/btrbk.timer
+UnitFileState=disabled
+TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=(null) }
+Result=success
+";
+        let service = "Id=btrbk.service
+ActiveState=inactive
+SubState=dead
+Result=success
+ExecStart={ path=/usr/bin/btrbk ; argv[]=/usr/bin/btrbk run ; ignore_errors=no }
+";
+        SystemdAdapter::apply_show(&mut task, Some(timer), Some(service));
+        assert_eq!(
+            task.location.as_deref(),
+            Some("/usr/lib/systemd/system/btrbk.timer")
+        );
+        assert_eq!(task.command, "/usr/bin/btrbk run");
+        assert!(matches!(task.schedule, ScheduleType::Calendar(ref c) if c == "*-*-* 00:00:00"));
+        assert_eq!(task.enabled, Some(false));
+        assert_eq!(task.last_status, None);
+    }
+
+    #[test]
+    fn listing_argv_is_pinned() {
+        assert_eq!(
+            LIST_TIMERS_ARGS.join(" "),
+            "list-timers --all --output=json --no-pager"
+        );
+        assert_eq!(
+            LIST_UNIT_FILES_ARGS.join(" "),
+            "list-unit-files --type=timer --all --output=json --no-pager"
+        );
     }
 
     #[test]

@@ -23,8 +23,8 @@ use shuvjobs_adapters::{
     launchd::LaunchctlEntry,
     process::{run_process, to_cmd_output},
     systemd::{
-        show_unit_groups, split_task_id, Scope, SERVICE_SHOW_PROPERTIES, SHOW_CHUNK_SIZE,
-        TIMER_SHOW_PROPERTIES,
+        merge_unit_file_tasks, show_unit_groups, split_task_id, Scope, LIST_TIMERS_ARGS,
+        LIST_UNIT_FILES_ARGS, SERVICE_SHOW_PROPERTIES, SHOW_CHUNK_SIZE, TIMER_SHOW_PROPERTIES,
     },
     AnacronAdapter, AtAdapter, CronAdapter, LaunchdAdapter, SystemdAdapter,
 };
@@ -567,8 +567,19 @@ fn systemctl_show_cmd(scope: Scope, units: &[String], properties: &str) -> Strin
 
 fn systemctl_list_timers_cmd(scope: Scope) -> String {
     format!(
-        "systemctl{} list-timers --all --output=json --no-pager",
-        scope_flag(scope)
+        "systemctl{} {}",
+        scope_flag(scope),
+        LIST_TIMERS_ARGS.join(" ")
+    )
+}
+
+/// The unit-file inventory, which unlike `list-timers` also names timers
+/// that are disabled and stopped (and therefore unloaded).
+fn systemctl_list_unit_files_cmd(scope: Scope) -> String {
+    format!(
+        "systemctl{} {}",
+        scope_flag(scope),
+        LIST_UNIT_FILES_ARGS.join(" ")
     )
 }
 
@@ -712,6 +723,20 @@ fn collect_systemd(
     {
         if let Ok(user_tasks) = SystemdAdapter::parse_list_timers_scoped(&user_json, Scope::User) {
             tasks.extend(user_tasks);
+        }
+    }
+
+    // `list-timers` only reports loaded units, so a disabled and stopped
+    // timer is invisible there. The unit-file inventory is the complete
+    // list; anything it names that the timer listing did not gets a
+    // placeholder task, filled in by the `show` pass below.
+    for scope in [Scope::System, Scope::User] {
+        let Some(json) = optional_remote_output(runner.run(&systemctl_list_unit_files_cmd(scope)))?
+        else {
+            continue;
+        };
+        if let Ok(extra) = SystemdAdapter::parse_list_unit_files_scoped(&json, scope) {
+            merge_unit_file_tasks(&mut tasks, extra);
         }
     }
 
@@ -1567,6 +1592,122 @@ ExecMainExitTimestampMonotonic=40202376368
         assert_eq!(tasks[0].id, "logrotate.timer");
     }
 
+    // Captured from `systemctl list-unit-files --type=timer --all
+    // --output=json --no-pager`. `btrbk.timer` is disabled and stopped,
+    // so it never appears in `list-timers`.
+    const SYSTEMD_UNIT_FILES: &str = r#"[
+        {"unit_file":"btrbk.timer","state":"disabled","preset":"disabled"},
+        {"unit_file":"btrfs-scrub@.timer","state":"disabled","preset":"disabled"},
+        {"unit_file":"logrotate.timer","state":"enabled","preset":"disabled"}
+    ]"#;
+    const SYSTEMD_SHOW_TIMER_WITH_DISABLED: &str = "\
+Id=btrbk.timer
+ActiveState=inactive
+FragmentPath=/usr/lib/systemd/system/btrbk.timer
+UnitFileState=disabled
+TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=(null) }
+Result=success
+
+Id=logrotate.timer
+ActiveState=active
+FragmentPath=/usr/lib/systemd/system/logrotate.timer
+UnitFileState=enabled
+TimersCalendar={ OnCalendar=*-*-* 00:00:00 ; next_elapse=Wed 2026-09-02 00:00:00 PDT }
+Result=success
+";
+    const SYSTEMD_SHOW_SERVICE_WITH_DISABLED: &str = "\
+Id=btrbk.service
+ExecStart={ path=/usr/bin/btrbk ; argv[]=/usr/bin/btrbk run ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Result=success
+ActiveState=inactive
+SubState=dead
+ExecMainStartTimestampMonotonic=0
+ExecMainExitTimestampMonotonic=0
+
+Id=logrotate.service
+ExecStart={ path=/usr/sbin/logrotate ; argv[]=/usr/sbin/logrotate /etc/logrotate.conf ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+Result=success
+ActiveState=inactive
+SubState=dead
+ExecMainStartTimestampMonotonic=40202351753
+ExecMainExitTimestampMonotonic=40202376368
+";
+
+    /// The defect this listing exists for: `btrbk.timer` is disabled and
+    /// stopped, so `list-timers` does not mention it, and before the
+    /// unit-file pass `shuvjobs list` could not see it at all.
+    #[test]
+    fn systemd_reports_timers_only_list_unit_files_knows_about() {
+        let mut fx = HashMap::new();
+        fx.insert(
+            "command -v systemctl >/dev/null 2>&1 && echo present",
+            "present\n",
+        );
+        fx.insert(
+            "systemctl list-timers --all --output=json --no-pager",
+            SYSTEMD_LIST,
+        );
+        fx.insert(
+            "systemctl list-unit-files --type=timer --all --output=json --no-pager",
+            SYSTEMD_UNIT_FILES,
+        );
+        fx.insert(
+            "systemctl show 'btrbk.timer' 'logrotate.timer' --property=Id,TimersCalendar,TimersMonotonic,Result,FragmentPath,UnitFileState,ActiveState --no-pager",
+            SYSTEMD_SHOW_TIMER_WITH_DISABLED,
+        );
+        fx.insert(
+            "systemctl show 'btrbk.service' 'logrotate.service' --property=Id,ExecStart,Result,ActiveState,SubState,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic --no-pager",
+            SYSTEMD_SHOW_SERVICE_WITH_DISABLED,
+        );
+
+        let tasks = collect_systemd(&FixtureRunner::new(fx)).unwrap();
+        // The template unit is skipped and the listed timer is not doubled.
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "logrotate.timer");
+        assert_eq!(tasks[0].enabled, Some(true));
+
+        let btrbk = &tasks[1];
+        assert_eq!(btrbk.id, "btrbk.timer");
+        assert_eq!(btrbk.name, "btrbk");
+        assert_eq!(btrbk.enabled, Some(false));
+        assert_eq!(btrbk.command, "/usr/bin/btrbk run");
+        assert!(matches!(btrbk.schedule, ScheduleType::Calendar(ref c) if c == "*-*-* 00:00:00"));
+        assert_eq!(
+            btrbk.location.as_deref(),
+            Some("/usr/lib/systemd/system/btrbk.timer")
+        );
+        assert!(btrbk.next_run.is_none());
+        assert!(btrbk.last_run.is_none());
+    }
+
+    /// The user manager has its own inventory, and a unit name present in
+    /// both scopes stays two distinct tasks.
+    #[test]
+    fn systemd_reads_the_user_unit_file_inventory_too() {
+        let mut fx = HashMap::new();
+        fx.insert(
+            "command -v systemctl >/dev/null 2>&1 && echo present",
+            "present\n",
+        );
+        fx.insert("systemctl list-timers --all --output=json --no-pager", "[]");
+        fx.insert(
+            "systemctl list-unit-files --type=timer --all --output=json --no-pager",
+            r#"[{"unit_file":"logrotate.timer","state":"disabled","preset":null}]"#,
+        );
+        fx.insert(
+            "systemctl --user list-unit-files --type=timer --all --output=json --no-pager",
+            r#"[{"unit_file":"logrotate.timer","state":"enabled","preset":null}]"#,
+        );
+
+        let tasks = collect_systemd(&FixtureRunner::new(fx)).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "logrotate.timer");
+        assert_eq!(tasks[0].enabled, Some(false));
+        assert_eq!(tasks[1].id, "user/logrotate.timer");
+        assert_eq!(tasks[1].name, "logrotate (user)");
+        assert_eq!(tasks[1].enabled, Some(true));
+    }
+
     #[test]
     fn systemctl_cmds_carry_the_user_flag_for_user_scope() {
         assert_eq!(
@@ -1576,6 +1717,14 @@ ExecMainExitTimestampMonotonic=40202376368
         assert_eq!(
             systemctl_list_timers_cmd(Scope::System),
             "systemctl list-timers --all --output=json --no-pager"
+        );
+        assert_eq!(
+            systemctl_list_unit_files_cmd(Scope::System),
+            "systemctl list-unit-files --type=timer --all --output=json --no-pager"
+        );
+        assert_eq!(
+            systemctl_list_unit_files_cmd(Scope::User),
+            "systemctl --user list-unit-files --type=timer --all --output=json --no-pager"
         );
         assert_eq!(
             systemctl_show_cmd(Scope::User, &["radar-daily.timer".into()], "Result"),

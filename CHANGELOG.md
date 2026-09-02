@@ -57,3 +57,11 @@
   file entries report their file, run-parts scripts report their path and
   executable bit, anacron entries report `/etc/anacrontab`, and launchd
   jobs report their plist and whether launchd has them loaded.
+- List systemd timers that `systemctl list-timers` cannot see. A timer that
+  has been disabled and stopped is unloaded, so it vanished from the listing
+  and `list`, `enable`, `edit`, and `rm` all reported it as not found. Both
+  the local adapter and the SSH bridge now also read
+  `systemctl [--user] list-unit-files --type=timer --all`, and every timer
+  unit file that the timer listing did not name is reported with its
+  schedule, command, location, and enablement. Template units (`foo@.timer`)
+  are skipped.
