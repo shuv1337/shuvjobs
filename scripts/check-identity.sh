@@ -46,7 +46,7 @@ if matches=$(find . -type f \
   ! -path './.jj/*' \
   ! -path './docs/FORK.md' \
   ! -path './scripts/check-identity.sh' \
-  -exec grep -nE '(^|[^[:alnum:]_])(sta|STA)([^[:alnum:]_]|$)|sta[-_]|github\.com/(ali|aligoren)/shuvjobs' {} + 2>/dev/null); then
+  -exec grep -nIE '(^|[^[:alnum:]_])(sta|STA)([^[:alnum:]_]|$)|sta[-_]|github\.com/(ali|aligoren)/shuvjobs' {} + 2>/dev/null); then
   printf '%s\n' "$matches" >&2
   fail "retired branding remains on canonical surfaces"
 fi

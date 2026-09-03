@@ -5,6 +5,10 @@
 First ShuvJobs release. Version 0.2.0 was reserved for the fork identity
 work and never tagged; everything below ships together as 0.3.0.
 
+- Exit quietly instead of panicking when stdout is closed early, e.g.
+  `shuvjobs list | head`.
+- Skip binary files in the fork identity check so it passes on macOS runners.
+
 - Establish the greenfield ShuvJobs product, package, command, and release identity.
 - Record the maintained-fork boundary and upstream sync policy.
 - Correct cron shortcut parsing and local/remote scheduler timezone handling.
