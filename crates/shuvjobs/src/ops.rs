@@ -437,7 +437,7 @@ pub fn confirm(prompt: &str, yes: bool) -> Result<bool> {
         )
         .into());
     }
-    print!("{prompt} [y/N] ");
+    out!("{prompt} [y/N] ");
     std::io::stdout().flush().ok();
     let mut answer = String::new();
     stdin.read_line(&mut answer)?;
@@ -628,7 +628,7 @@ pub fn print_table(tasks: &[ScheduledTask]) {
                 line.extend(std::iter::repeat_n(' ', pad));
             }
         }
-        println!("{}", line.trim_end());
+        outln!("{}", line.trim_end());
     }
 }
 
@@ -670,7 +670,7 @@ pub fn print_task(task: &ScheduledTask) {
     ];
     let width = fields.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     for (key, value) in fields {
-        println!("{key:<width$}  {value}", width = width);
+        outln!("{key:<width$}  {value}", width = width);
     }
 }
 

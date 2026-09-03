@@ -1,5 +1,30 @@
 //! Binary entry point. The only place `shuvjobs-adapters` and `shuvjobs-tui` meet.
 
+/// Write to stdout, exiting quietly when the reader has gone away
+/// (`shuvjobs list | head`) instead of panicking on a broken pipe.
+fn write_stdout(args: std::fmt::Arguments<'_>, newline: bool) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let result = if newline {
+        lock.write_fmt(args).and_then(|_| lock.write_all(b"\n"))
+    } else {
+        lock.write_fmt(args).and_then(|_| lock.flush())
+    };
+    if let Err(e) = result {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+    }
+}
+
+macro_rules! outln {
+    ($($arg:tt)*) => { $crate::write_stdout(format_args!($($arg)*), true) };
+}
+macro_rules! out {
+    ($($arg:tt)*) => { $crate::write_stdout(format_args!($($arg)*), false) };
+}
+
 mod cli;
 mod ops;
 mod remote;
@@ -73,7 +98,7 @@ fn list(global: &Global) -> Result<()> {
     let session = Session::open(global)?;
     let tasks = session.collect()?;
     if global.json {
-        println!("{}", export::serialize_tasks(&tasks)?);
+        outln!("{}", export::serialize_tasks(&tasks)?);
     } else {
         ops::print_table(&tasks);
     }
@@ -87,7 +112,7 @@ fn show(global: &Global, args: &IdArgs, context: &mut OpContext) -> Result<()> {
     let task = session.resolve(&args.id, args.source.map(TaskSourceKind::from))?;
     if global.json {
         let export = ExportTask::from(&task);
-        println!("{}", serde_json::to_string_pretty(&export)?);
+        outln!("{}", serde_json::to_string_pretty(&export)?);
     } else {
         ops::print_task(&task);
     }
@@ -196,9 +221,9 @@ fn run_mutation(session: &Session, global: &Global, op: Op, context: &mut OpCont
             session.policy(),
             &backups,
         );
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        outln!("{}", serde_json::to_string_pretty(&report)?);
     } else if session.dry_run {
-        print!("{}", session.render_plan(&outcome));
+        out!("{}", session.render_plan(&outcome));
     } else {
         print_success(&op, &outcome, &backups);
     }
@@ -211,7 +236,7 @@ fn print_success(op: &Op, outcome: &MutationOutcome, backups: &HashMap<String, S
         .as_deref()
         .or_else(|| op.id())
         .unwrap_or("(unnamed)");
-    println!("{} {} task {id}", past_tense(op), op.source());
+    outln!("{} {} task {id}", past_tense(op), op.source());
     for change in &outcome.changes {
         match change {
             shuvjobs_core::Change::WriteFile { path, .. }
@@ -222,15 +247,15 @@ fn print_success(op: &Op, outcome: &MutationOutcome, backups: &HashMap<String, S
                     "wrote"
                 };
                 match backups.get(path) {
-                    Some(saved) => println!("  {verb} {path} (backup {saved})"),
-                    None => println!("  {verb} {path}"),
+                    Some(saved) => outln!("  {verb} {path} (backup {saved})"),
+                    None => outln!("  {verb} {path}"),
                 }
             }
-            shuvjobs_core::Change::Command { cmd, .. } => println!("  ran {cmd}"),
+            shuvjobs_core::Change::Command { cmd, .. } => outln!("  ran {cmd}"),
         }
     }
     for note in &outcome.notes {
-        println!("  note: {note}");
+        outln!("  note: {note}");
     }
 }
 
@@ -248,7 +273,7 @@ fn report_error(err: &anyhow::Error, json: bool, context: &OpContext) {
     if json {
         let report = ErrorReport::new(err, context.op, context.id.clone());
         match serde_json::to_string_pretty(&report) {
-            Ok(text) => println!("{text}"),
+            Ok(text) => outln!("{text}"),
             Err(_) => eprintln!("error: {err:#}"),
         }
     } else {
