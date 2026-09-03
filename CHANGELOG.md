@@ -1,6 +1,9 @@
 # Changelog
 
-## 0.2.0 - Unreleased
+## 0.3.0 - 2026-09-02
+
+First ShuvJobs release. Version 0.2.0 was reserved for the fork identity
+work and never tagged; everything below ships together as 0.3.0.
 
 - Establish the greenfield ShuvJobs product, package, command, and release identity.
 - Record the maintained-fork boundary and upstream sync policy.

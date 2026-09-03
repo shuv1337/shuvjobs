@@ -1373,7 +1373,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shuvjobs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "shuvjobs-adapters"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "croner",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "shuvjobs-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1411,7 +1411,7 @@ dependencies = [
 
 [[package]]
 name = "shuvjobs-tui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",

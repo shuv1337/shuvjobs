@@ -8,16 +8,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/shuv1337/shuvjobs"
 rust-version = "1.88"
 
 [workspace.dependencies]
-shuvjobs-core = { version = "0.2.0", path = "crates/shuvjobs-core" }
-shuvjobs-adapters = { version = "0.2.0", path = "crates/shuvjobs-adapters" }
-shuvjobs-tui = { version = "0.2.0", path = "crates/shuvjobs-tui" }
+shuvjobs-core = { version = "0.3.0", path = "crates/shuvjobs-core" }
+shuvjobs-adapters = { version = "0.3.0", path = "crates/shuvjobs-adapters" }
+shuvjobs-tui = { version = "0.3.0", path = "crates/shuvjobs-tui" }
 
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
