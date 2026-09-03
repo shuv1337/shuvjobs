@@ -1202,7 +1202,7 @@ fn draw_table(
                 Cell::from(t.name.clone()),
                 Cell::from(format_schedule(&t.schedule)),
                 Cell::from(format_optional_dt(t.last_run, now)),
-                Cell::from(format_status(t.last_status.as_ref())),
+                Cell::from(status_span(t.last_status.as_ref())),
                 Cell::from(format_optional_dt(t.next_run, now)),
             ])
         })
@@ -1298,10 +1298,10 @@ fn format_dt_with_relative(dt: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Str
 
 fn format_status_long(s: Option<&TaskStatus>) -> String {
     match s {
-        Some(TaskStatus::Success) => "✅ Success".into(),
-        Some(TaskStatus::Failed(msg)) if !msg.is_empty() => format!("❌ Failed ({msg})"),
-        Some(TaskStatus::Failed(_)) => "❌ Failed".into(),
-        Some(TaskStatus::Running) => "⏳ Running".into(),
+        Some(TaskStatus::Success) => "ok".into(),
+        Some(TaskStatus::Failed(msg)) if !msg.is_empty() => format!("failed ({msg})"),
+        Some(TaskStatus::Failed(_)) => "failed".into(),
+        Some(TaskStatus::Running) => "running".into(),
         None => "-".into(),
     }
 }
@@ -1427,11 +1427,21 @@ fn format_schedule(s: &ScheduleType) -> String {
 
 fn format_status(s: Option<&TaskStatus>) -> &'static str {
     match s {
-        Some(TaskStatus::Success) => "✅",
-        Some(TaskStatus::Failed(_)) => "❌",
-        Some(TaskStatus::Running) => "⏳",
+        Some(TaskStatus::Success) => "ok",
+        Some(TaskStatus::Failed(_)) => "fail",
+        Some(TaskStatus::Running) => "run",
         None => "-",
     }
+}
+
+fn status_span(s: Option<&TaskStatus>) -> Span<'static> {
+    let style = match s {
+        Some(TaskStatus::Success) => Style::default().fg(Color::Green),
+        Some(TaskStatus::Failed(_)) => Style::default().fg(Color::Red),
+        Some(TaskStatus::Running) => Style::default().fg(Color::Yellow),
+        None => Style::default(),
+    };
+    Span::styled(format_status(s), style)
 }
 
 fn format_optional_dt_in<Tz>(dt: Option<DateTime<Utc>>, now: DateTime<Utc>, tz: &Tz) -> String
@@ -1639,14 +1649,15 @@ mod tests {
     #[test]
     fn status_glyphs_and_long_form() {
         assert_eq!(format_status(None), "-");
-        assert_eq!(format_status(Some(&TaskStatus::Running)), "⏳");
+        assert_eq!(format_status(Some(&TaskStatus::Success)), "ok");
+        assert_eq!(format_status(Some(&TaskStatus::Running)), "run");
         assert_eq!(
             format_status_long(Some(&TaskStatus::Failed("exit-code".into()))),
-            "❌ Failed (exit-code)"
+            "failed (exit-code)"
         );
         assert_eq!(
             format_status_long(Some(&TaskStatus::Failed(String::new()))),
-            "❌ Failed"
+            "failed"
         );
     }
 
